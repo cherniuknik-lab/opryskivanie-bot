@@ -36,6 +36,7 @@ BTN_FILLERS = "👤 Заправщики"
 
 BTN_ADD = "➕ Добавить"
 BTN_EDIT = "✏️ Изменить"
+BTN_EDIT_CULTURE = "🌱 Изменить культуру"
 BTN_DELETE = "🗑 Удалить"
 BTN_LIST = "📋 Список"
 BTN_BACK = "⬅️ Назад"
@@ -209,8 +210,12 @@ def active_kb():
     ])
 
 
-def section_kb():
-    return keyboard([[BTN_ADD, BTN_EDIT], [BTN_DELETE, BTN_LIST], [BTN_BACK]])
+def section_kb(table=None):
+    rows = [[BTN_ADD, BTN_EDIT], [BTN_DELETE, BTN_LIST]]
+    if table == "fields":
+        rows.append([BTN_EDIT_CULTURE])
+    rows.append([BTN_BACK])
+    return keyboard(rows)
 
 
 def reports_kb():
@@ -999,7 +1004,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             flow[uid] = {"mode": "section", "table": table}
             await update.message.reply_text(
                 "🗑 Удалено из активного списка. История работ сохранена.",
-                reply_markup=section_kb()
+                reply_markup=section_kb(table)
             )
             return
 
@@ -1015,6 +1020,59 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✏️ Текущее название: {row['name']}\\n"
             "Введите новое название:"
+        )
+        return
+
+    if state and state.get("mode") == "field_culture_select" and text in state["map"]:
+        field_id = state["map"][text]
+        with db() as c:
+            field = c.execute(
+                "SELECT id,name,area,culture FROM fields WHERE id=? AND active=1",
+                (field_id,)
+            ).fetchone()
+            cultures = [r["name"] for r in c.execute(
+                "SELECT name FROM cultures WHERE active=1 ORDER BY name"
+            ).fetchall()]
+        if not field:
+            flow[uid] = {"mode": "section", "table": "fields"}
+            await update.message.reply_text(
+                "Поле больше не доступно.", reply_markup=section_kb("fields")
+            )
+            return
+        flow[uid] = {"mode": "field_culture_choose", "field": dict(field)}
+        await update.message.reply_text(
+            f"🌾 Поле: {field['name']}\n"
+            f"Текущая культура: {field['culture']}\n\n"
+            "Выберите новую культуру:",
+            reply_markup=rows_kb(cultures)
+        )
+        return
+
+    if state and state.get("mode") == "field_culture_choose":
+        with db() as c:
+            culture = c.execute(
+                "SELECT 1 FROM cultures WHERE name=? AND active=1", (text,)
+            ).fetchone()
+            if not culture:
+                await update.message.reply_text("Выберите культуру из списка.")
+                return
+            field = state["field"]
+            changed = c.execute(
+                "UPDATE fields SET culture=? WHERE id=? AND active=1",
+                (text, field["id"])
+            ).rowcount
+        flow[uid] = {"mode": "section", "table": "fields"}
+        if not changed:
+            await update.message.reply_text(
+                "Поле больше не доступно.", reply_markup=section_kb("fields")
+            )
+            return
+        await update.message.reply_text(
+            f"✅ Культура изменена.\n"
+            f"🌾 {field['name']}\n"
+            f"{field['culture']} → {text}\n"
+            f"Площадь: {fmt(field['area'])} га",
+            reply_markup=section_kb("fields")
         )
         return
 
@@ -1047,7 +1105,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Такое название уже существует.")
                 return
         flow[uid] = {"mode": "section", "table": table}
-        await update.message.reply_text("✅ Изменено.", reply_markup=section_kb())
+        await update.message.reply_text("✅ Изменено.", reply_markup=section_kb(table))
         return
 
     if state and state.get("mode") == "crud_edit_field_area":
@@ -1070,6 +1128,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state and state.get("mode") == "crud_edit_field_culture":
         with db() as c:
+            if not c.execute(
+                "SELECT 1 FROM cultures WHERE name=? AND active=1", (text,)
+            ).fetchone():
+                await update.message.reply_text("Выберите культуру из списка.")
+                return
             try:
                 c.execute(
                     "UPDATE fields SET name=?,area=?,culture=? WHERE id=?",
@@ -1079,7 +1142,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Поле с таким названием уже существует.")
                 return
         flow[uid] = {"mode": "section", "table": "fields"}
-        await update.message.reply_text("✅ Поле изменено.", reply_markup=section_kb())
+        await update.message.reply_text("✅ Поле изменено.", reply_markup=section_kb("fields"))
         return
 
     if state and state.get("mode") == "crud_edit_chem_unit":
@@ -1187,7 +1250,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         flow.pop(uid, None)
-        await update.message.reply_text("✅ Поле добавлено.", reply_markup=section_kb())
+        await update.message.reply_text("✅ Поле добавлено.", reply_markup=section_kb("fields"))
         return
 
     # ---------- Итоги: выбор активной даты / поля ----------
@@ -1470,11 +1533,27 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }[text]
 
         flow[uid] = {"mode": "section", "table": table}
-        await update.message.reply_text(text, reply_markup=section_kb())
+        await update.message.reply_text(text, reply_markup=section_kb(table))
         return
 
     if state and state.get("mode") == "section":
         table = state["table"]
+
+        if table == "fields" and text == BTN_EDIT_CULTURE:
+            with db() as c:
+                rs = c.execute(
+                    "SELECT id,name,area,culture FROM fields WHERE active=1 ORDER BY name"
+                ).fetchall()
+            mapping = {
+                f"🌾 {r['name']} | {r['culture']} | {fmt(r['area'])} га": r["id"]
+                for r in rs
+            }
+            flow[uid] = {"mode": "field_culture_select", "map": mapping}
+            await update.message.reply_text(
+                "Выберите поле, у которого нужно изменить культуру:",
+                reply_markup=rows_kb(mapping.keys())
+            )
+            return
 
         if text == BTN_LIST:
             with db() as c:
@@ -1501,7 +1580,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(
                 "📋 СПИСОК\n\n" + ("\n".join(lines) if lines else "Список пуст."),
-                reply_markup=section_kb()
+                reply_markup=section_kb(table)
             )
             return
 
