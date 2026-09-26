@@ -1219,7 +1219,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         flow.pop(uid, None)
-        await update.message.reply_text("\\n".join(lines), reply_markup=main_kb())
+        await update.message.reply_text("\n".join(lines), reply_markup=main_kb())
         return
 
     # ---------- Основные кнопки ----------
