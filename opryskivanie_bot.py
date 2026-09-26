@@ -26,6 +26,8 @@ BTN_CHEM = "🧪 Химия"
 BTN_FILLERS = "👤 Заправщики"
 
 BTN_ADD = "➕ Добавить"
+BTN_EDIT = "✏️ Изменить"
+BTN_DELETE = "🗑 Удалить"
 BTN_LIST = "📋 Список"
 BTN_BACK = "⬅️ Назад"
 BTN_CANCEL = "❌ Отмена"
@@ -124,7 +126,7 @@ def active_kb():
 
 
 def section_kb():
-    return keyboard([[BTN_ADD, BTN_LIST], [BTN_BACK]])
+    return keyboard([[BTN_ADD, BTN_EDIT], [BTN_DELETE, BTN_LIST], [BTN_BACK]])
 
 
 def rows_kb(items, back=True):
@@ -197,7 +199,10 @@ def init_db():
             total_solution_l REAL NOT NULL,
             water_to_add_l REAL NOT NULL,
             filler_name TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            end_residual_l REAL,
+            actual_sprayed_ha REAL,
+            closed_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS refill_chemicals(
@@ -209,6 +214,16 @@ def init_db():
             amount REAL NOT NULL
         );
         """)
+
+        # Миграция старой базы: новые поля для фактической выработки.
+        refill_cols = {r["name"] for r in c.execute("PRAGMA table_info(refills)").fetchall()}
+        for col, ddl in [
+            ("end_residual_l", "REAL"),
+            ("actual_sprayed_ha", "REAL"),
+            ("closed_at", "TEXT"),
+        ]:
+            if col not in refill_cols:
+                c.execute(f"ALTER TABLE refills ADD COLUMN {col} {ddl}")
 
         if c.execute("SELECT COUNT(*) n FROM fields").fetchone()["n"] == 0:
             c.executemany(
@@ -279,6 +294,52 @@ async def choose_chemical(update, job_id):
     )
 
 
+def close_previous_refill(job, residual):
+    """Закрывает предыдущую незакрытую заправку по остатку перед новой."""
+    with db() as c:
+        prev = c.execute(
+            """SELECT * FROM refills
+               WHERE job_id=? AND end_residual_l IS NULL
+               ORDER BY seq DESC LIMIT 1""",
+            (job["id"],)
+        ).fetchone()
+
+        if not prev:
+            return None
+
+        if residual > prev["total_solution_l"] + 0.0001:
+            return {"error": (
+                f"Остаток {fmt(residual)} л больше объёма предыдущей "
+                f"заправки {fmt(prev['total_solution_l'])} л."
+            )}
+
+        used_l = max(0.0, prev["total_solution_l"] - residual)
+        actual_ha = used_l / job["water_rate"]
+
+        c.execute(
+            """UPDATE refills
+               SET end_residual_l=?, actual_sprayed_ha=?, closed_at=?
+               WHERE id=?""",
+            (
+                residual, actual_ha,
+                local_now().isoformat(timespec="seconds"),
+                prev["id"]
+            )
+        )
+
+        # Фактически израсходованная химия предыдущей заправки:
+        # доля использованного раствора × количество химии, находившееся
+        # в приготовленном объёме этой заправки.
+        # refill_chemicals хранит добавленную химию. Для рабочего раствора
+        # фактический расход корректно считаем по норме × фактические гектары.
+        return {
+            "seq": prev["seq"],
+            "actual_ha": actual_ha,
+            "used_l": used_l,
+            "residual": residual,
+        }
+
+
 async def choose_filler(update, refill_type, target_ha, residual):
     uid = update.effective_user.id
     with db() as c:
@@ -347,10 +408,11 @@ async def save_refill(update, job, refill_type, target_ha, residual, filler):
             (job["id"],)
         ).fetchall()
 
+        chemical_ha = water_to_add / job["water_rate"]
         for r in recipe:
-            # По согласованной логике «заправки на площадь» препарат
-            # рассчитывается на указанное число гектаров.
-            amount = target_ha * r["rate_per_ha"]
+            # В остатке уже есть рабочий раствор с химией.
+            # Поэтому новую химию добавляем только на доливаемую воду.
+            amount = chemical_ha * r["rate_per_ha"]
             c.execute(
                 """INSERT INTO refill_chemicals(
                     refill_id,chemical_name,unit,rate_per_ha,amount
@@ -367,6 +429,7 @@ async def save_refill(update, job, refill_type, target_ha, residual, filler):
         f"🌾 Поле: {job['field_name']}",
         f"🌱 Культура: {job['culture']}",
         f"👤 Заправщик: {filler}",
+        f"🕐 Время заправки: {local_now().strftime('%H:%M')}",
         "",
         f"🎯 Площадь: {fmt(target_ha)} га",
         f"💧 Норма воды: {fmt(job['water_rate'])} л/га",
@@ -374,13 +437,16 @@ async def save_refill(update, job, refill_type, target_ha, residual, filler):
         f"💧 Остаток в баке: {fmt(residual)} л",
         f"➕ Долить воды: {fmt(water_to_add)} л",
         "",
+        f"🧮 Химия рассчитывается на: {fmt(water_to_add / job['water_rate'])} га",
+        "",
         "🧪 ДОБАВИТЬ:"
     ]
 
+    chemical_ha = water_to_add / job["water_rate"]
     for r in recipe:
         lines.append(
             f"• {r['chemical_name']} — "
-            f"{fmt(target_ha * r['rate_per_ha'])} {r['unit']}"
+            f"{fmt(chemical_ha * r['rate_per_ha'])} {r['unit']}"
         )
 
     await update.message.reply_text(
@@ -406,7 +472,8 @@ async def show_total(update, job):
             (job["id"],)
         ).fetchall()
 
-    ha = sum(x["target_ha"] for x in refills)
+    prepared_ha = sum(x["target_ha"] for x in refills)
+    actual_ha = sum(float(x["actual_sprayed_ha"] or 0) for x in refills)
     water = sum(x["water_to_add_l"] for x in refills)
 
     lines = [
@@ -414,7 +481,8 @@ async def show_total(update, job):
         "",
         f"🌾 {job['field_name']} | {job['culture']}",
         f"🚿 Заправок: {len(refills)}",
-        f"🎯 Расчётная площадь: {fmt(ha)} га",
+        f"🚜 Фактически обработано: {fmt(actual_ha)} га",
+        f"🎯 Приготовлено на: {fmt(prepared_ha)} га",
         f"💧 Долито воды: {fmt(water)} л",
     ]
 
@@ -610,6 +678,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        closed = close_previous_refill(job, residual)
+        if closed and closed.get("error"):
+            await update.message.reply_text(closed["error"])
+            return
+        if closed:
+            await update.message.reply_text(
+                f"✅ Предыдущая заправка №{closed['seq']} завершена.\n"
+                f"🚜 Выработано: {fmt(closed['actual_ha'])} га\n"
+                f"💧 Использовано раствора: {fmt(closed['used_l'])} л\n"
+                f"💧 Остаток: {fmt(residual)} л"
+            )
+
         await choose_filler(update, "full", None, residual)
         return
 
@@ -652,6 +732,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        closed = close_previous_refill(job, residual)
+        if closed and closed.get("error"):
+            await update.message.reply_text(closed["error"])
+            return
+        if closed:
+            await update.message.reply_text(
+                f"✅ Предыдущая заправка №{closed['seq']} завершена.\n"
+                f"🚜 Выработано: {fmt(closed['actual_ha'])} га\n"
+                f"💧 Использовано раствора: {fmt(closed['used_l'])} л\n"
+                f"💧 Остаток: {fmt(residual)} л"
+            )
+
         await choose_filler(update, "partial", area, residual)
         return
 
@@ -670,6 +762,114 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_refill(
             update, job, refill_type, target_ha, residual, text
         )
+        return
+
+    # ---------- Изменение / удаление справочников ----------
+    if state and state.get("mode") == "crud_select" and text in state["map"]:
+        item_id = state["map"][text]
+        table = state["table"]
+
+        if state["action"] == "delete":
+            with db() as c:
+                c.execute(f"UPDATE {table} SET active=0 WHERE id=?", (item_id,))
+            flow[uid] = {"mode": "section", "table": table}
+            await update.message.reply_text(
+                "🗑 Удалено из активного списка. История работ сохранена.",
+                reply_markup=section_kb()
+            )
+            return
+
+        with db() as c:
+            row = c.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
+
+        flow[uid] = {
+            "mode": "crud_edit_name",
+            "table": table,
+            "id": item_id,
+            "old": dict(row)
+        }
+        await update.message.reply_text(
+            f"✏️ Текущее название: {row['name']}\\n"
+            "Введите новое название:"
+        )
+        return
+
+    if state and state.get("mode") == "crud_edit_name":
+        table = state["table"]
+        item_id = state["id"]
+
+        if table == "fields":
+            state["new_name"] = text
+            state["mode"] = "crud_edit_field_area"
+            await update.message.reply_text(
+                f"Текущая площадь: {fmt(state['old']['area'])} га\\n"
+                "Введите новую площадь:"
+            )
+            return
+
+        if table == "chemicals":
+            state["new_name"] = text
+            state["mode"] = "crud_edit_chem_unit"
+            await update.message.reply_text(
+                f"Текущая единица: {state['old']['unit']}\\n"
+                "Введите новую единицу (обычно л):"
+            )
+            return
+
+        with db() as c:
+            try:
+                c.execute(f"UPDATE {table} SET name=? WHERE id=?", (text, item_id))
+            except sqlite3.IntegrityError:
+                await update.message.reply_text("Такое название уже существует.")
+                return
+        flow[uid] = {"mode": "section", "table": table}
+        await update.message.reply_text("✅ Изменено.", reply_markup=section_kb())
+        return
+
+    if state and state.get("mode") == "crud_edit_field_area":
+        area = number(text)
+        if not area or area <= 0:
+            await update.message.reply_text("Введите площадь числом.")
+            return
+        state["new_area"] = area
+        with db() as c:
+            cultures = [r["name"] for r in c.execute(
+                "SELECT name FROM cultures WHERE active=1 ORDER BY name"
+            ).fetchall()]
+        state["mode"] = "crud_edit_field_culture"
+        await update.message.reply_text(
+            f"Текущая культура: {state['old']['culture']}\\n"
+            "Выберите новую культуру:",
+            reply_markup=rows_kb(cultures)
+        )
+        return
+
+    if state and state.get("mode") == "crud_edit_field_culture":
+        with db() as c:
+            try:
+                c.execute(
+                    "UPDATE fields SET name=?,area=?,culture=? WHERE id=?",
+                    (state["new_name"], state["new_area"], text, state["id"])
+                )
+            except sqlite3.IntegrityError:
+                await update.message.reply_text("Поле с таким названием уже существует.")
+                return
+        flow[uid] = {"mode": "section", "table": "fields"}
+        await update.message.reply_text("✅ Поле изменено.", reply_markup=section_kb())
+        return
+
+    if state and state.get("mode") == "crud_edit_chem_unit":
+        with db() as c:
+            try:
+                c.execute(
+                    "UPDATE chemicals SET name=?,unit=? WHERE id=?",
+                    (state["new_name"], text, state["id"])
+                )
+            except sqlite3.IntegrityError:
+                await update.message.reply_text("Такой препарат уже существует.")
+                return
+        flow[uid] = {"mode": "section", "table": "chemicals"}
+        await update.message.reply_text("✅ Препарат изменён.", reply_markup=section_kb())
         return
 
     # ---------- Добавление справочников ----------
@@ -766,6 +966,53 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Поле добавлено.", reply_markup=section_kb())
         return
 
+    # ---------- Завершение: остаток последней заправки ----------
+    if state and state.get("mode") == "finish_residual":
+        residual = number(text)
+        if residual is None or residual < 0:
+            await update.message.reply_text("Введите остаток в литрах.")
+            return
+
+        job = active_job(uid)
+        closed = close_previous_refill(job, residual)
+        if closed and closed.get("error"):
+            await update.message.reply_text(closed["error"])
+            return
+
+        with db() as c:
+            c.execute(
+                "UPDATE jobs SET status='done',finished_at=? WHERE id=?",
+                (local_now().isoformat(timespec="seconds"), job["id"])
+            )
+            actual_ha = c.execute(
+                "SELECT COALESCE(SUM(actual_sprayed_ha),0) s FROM refills WHERE job_id=?",
+                (job["id"],)
+            ).fetchone()["s"]
+            recipe = c.execute(
+                "SELECT chemical_name,unit,rate_per_ha FROM recipes WHERE job_id=? ORDER BY id",
+                (job["id"],)
+            ).fetchall()
+
+        lines = [
+            "✅ РАБОТА ПО ПОЛЮ ЗАВЕРШЕНА",
+            "",
+            f"🌾 Поле: {job['field_name']}",
+            f"🌱 Культура: {job['culture']}",
+            f"🚜 Фактически обработано: {fmt(actual_ha)} га",
+            f"💧 Остаток в опрыскивателе: {fmt(residual)} л",
+            "",
+            "🧪 ФАКТИЧЕСКИ ПОШЛО НА ПОЛЕ:"
+        ]
+        for r in recipe:
+            lines.append(
+                f"• {r['chemical_name']} — "
+                f"{fmt(actual_ha * r['rate_per_ha'])} {r['unit']}"
+            )
+
+        flow.pop(uid, None)
+        await update.message.reply_text("\\n".join(lines), reply_markup=main_kb())
+        return
+
     # ---------- Основные кнопки ----------
     if text == BTN_NEW:
         if job:
@@ -799,16 +1046,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == BTN_FINISH and job:
-        with db() as c:
-            c.execute(
-                "UPDATE jobs SET status='done',finished_at=? WHERE id=?",
-                (local_now().isoformat(timespec="seconds"), job["id"])
-            )
-
-        flow.pop(uid, None)
+        flow[uid] = {"mode": "finish_residual"}
         await update.message.reply_text(
-            "✅ Работа по полю завершена.",
-            reply_markup=main_kb()
+            "✅ ЗАВЕРШЕНИЕ ПОЛЯ\n\n"
+            "💧 Сколько раствора осталось в опрыскивателе, л?\n"
+            "Если бак пустой — введите 0."
         )
         return
 
@@ -858,6 +1100,25 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "📋 СПИСОК\n\n" + ("\n".join(lines) if lines else "Список пуст."),
                 reply_markup=section_kb()
+            )
+            return
+
+        if text in (BTN_EDIT, BTN_DELETE):
+            with db() as c:
+                if table == "fields":
+                    rs = c.execute("SELECT id,name FROM fields WHERE active=1 ORDER BY name").fetchall()
+                else:
+                    rs = c.execute(f"SELECT id,name FROM {table} WHERE active=1 ORDER BY name").fetchall()
+            mapping = {r["name"]: r["id"] for r in rs}
+            flow[uid] = {
+                "mode": "crud_select",
+                "table": table,
+                "action": "edit" if text == BTN_EDIT else "delete",
+                "map": mapping
+            }
+            await update.message.reply_text(
+                "Что изменить?" if text == BTN_EDIT else "Что удалить?",
+                reply_markup=rows_kb(mapping.keys())
             )
             return
 
