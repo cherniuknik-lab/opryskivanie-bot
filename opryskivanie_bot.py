@@ -1,4 +1,5 @@
 import os
+import math
 import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -27,12 +28,14 @@ BTN_SEASON = "🏆 За сезон"
 BTN_NEXT = "🚿 Следующая заправка"
 BTN_PARTIAL = "🎯 Заправка на площадь"
 BTN_TOTAL = "📊 Текущий итог"
+BTN_PLANNED_REFILLS = "🧮 Всего заправок"
 BTN_FINISH = "✅ Завершить поле"
 
 BTN_FIELDS = "🌾 Поля"
 BTN_CULTURES = "🌱 Культуры"
 BTN_CHEM = "🧪 Химия"
 BTN_FILLERS = "👤 Заправщики"
+BTN_TRACTORS = "🚜 Тракторы"
 
 BTN_ADD = "➕ Добавить"
 BTN_EDIT = "✏️ Изменить"
@@ -199,13 +202,15 @@ def main_kb():
         [BTN_CORRECT_LAST, BTN_DELETE_JOB],
         [BTN_FIELDS, BTN_CULTURES],
         [BTN_CHEM, BTN_FILLERS],
+        [BTN_TRACTORS],
     ])
 
 
 def active_kb():
     return keyboard([
         [BTN_NEXT, BTN_PARTIAL],
-        [BTN_TOTAL, BTN_REPORTS],
+        [BTN_TOTAL, BTN_PLANNED_REFILLS],
+        [BTN_REPORTS],
         [BTN_FINISH],
     ])
 
@@ -270,6 +275,13 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1
         );
 
+        CREATE TABLE IF NOT EXISTS tractors(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            water_capacity_l REAL NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
         CREATE TABLE IF NOT EXISTS jobs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -320,6 +332,14 @@ def init_db():
         """)
 
         # Миграция старой базы: новые поля для фактической выработки.
+        job_cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+        for col, ddl in [
+            ("tractor_id", "INTEGER"),
+            ("tractor_name", "TEXT"),
+            ("water_capacity_l", "REAL"),
+        ]:
+            if col not in job_cols:
+                c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
         refill_cols = {r["name"] for r in c.execute("PRAGMA table_info(refills)").fetchall()}
         for col, ddl in [
             ("end_residual_l", "REAL"),
@@ -365,6 +385,40 @@ def active_job(uid):
         ).fetchone()
 
 
+def planned_refills(job):
+    """Полный план по полю: заправки бака и подвоз воды считаются отдельно."""
+    total_water = float(job["field_area"]) * float(job["water_rate"])
+    tank = float(job["tank_volume"])
+    count = math.ceil(total_water / tank - 1e-10)
+    last_tank = total_water - tank * (count - 1)
+    lines = [
+        "🧮 ПЛАН ЗАПРАВОК НА ВСЁ ПОЛЕ", "",
+        f"🌾 {job['field_name']} | {job['culture']}",
+        f"🎯 Площадь: {fmt(job['field_area'])} га",
+        f"💧 Норма воды: {fmt(job['water_rate'])} л/га",
+        f"💧 Всего раствора: {fmt(total_water)} л",
+        f"🚿 Бак опрыскивателя: {fmt(tank)} л",
+        f"🚿 Заправок опрыскивателя: {count}",
+        f"Последняя заправка: {fmt(last_tank)} л",
+    ]
+    capacity = job["water_capacity_l"]
+    if capacity and capacity > 0:
+        loads = math.ceil(total_water / capacity - 1e-10)
+        last_load = total_water - capacity * (loads - 1)
+        lines += [
+            "", f"🚜 {job['tractor_name']} | Вода в прицепе: {fmt(capacity)} л",
+            f"🛢 Подвозов воды: {loads}",
+            f"Последний подвоз: {fmt(last_load)} л",
+        ]
+        full_tanks = int(capacity // tank)
+        if full_tanks:
+            lines.append(
+                f"Из полного прицепа: {full_tanks} полных заправок бака, "
+                f"остаток {fmt(capacity - full_tanks * tank)} л"
+            )
+    return lines
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = active_job(update.effective_user.id)
     await update.message.reply_text(
@@ -378,11 +432,30 @@ async def begin_job(update):
     uid = update.effective_user.id
     with db() as c:
         rs = c.execute(
+            "SELECT id,name,water_capacity_l FROM tractors WHERE active=1 ORDER BY name"
+        ).fetchall()
+
+    if not rs:
+        await update.message.reply_text(
+            "Сначала добавьте трактор и объём его бочки в разделе «🚜 Тракторы».",
+            reply_markup=main_kb()
+        )
+        return
+
+    mapping = {f"🚜 {r['name']} | {fmt(r['water_capacity_l'])} л": r["id"] for r in rs}
+    flow[uid] = {"mode": "job_tractor", "map": mapping}
+    await update.message.reply_text("🚜 Выберите трактор:", reply_markup=rows_kb(mapping.keys()))
+
+
+async def choose_job_field(update, tractor):
+    uid = update.effective_user.id
+    with db() as c:
+        rs = c.execute(
             "SELECT id,name,area FROM fields WHERE active=1 ORDER BY name"
         ).fetchall()
 
     mapping = {f"🌾 {r['name']} | {fmt(r['area'])} га": r["id"] for r in rs}
-    flow[uid] = {"mode": "field", "map": mapping}
+    flow[uid] = {"mode": "field", "map": mapping, "tractor": tractor}
 
     await update.message.reply_text(
         "🌾 Выберите поле:",
@@ -561,6 +634,14 @@ async def save_refill(update, job, refill_type, target_ha, residual, filler):
             f"{fmt(chemical_ha * r['rate_per_ha'])} {r['unit']}"
         )
 
+    if seq == 1:
+        lines += [""] + planned_refills(job) + ["", "🧪 ХИМИЯ НА ВСЁ ПОЛЕ:"]
+        for r in recipe:
+            lines.append(
+                f"• {r['chemical_name']}: {fmt(r['rate_per_ha'])} {r['unit']}/га"
+                f" → {fmt(float(job['field_area']) * r['rate_per_ha'])} {r['unit']}"
+            )
+
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=active_kb()
@@ -738,6 +819,17 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------- Создание новой работы ----------
+    if state and state.get("mode") == "job_tractor" and text in state["map"]:
+        with db() as c:
+            tractor = c.execute(
+                "SELECT * FROM tractors WHERE id=? AND active=1", (state["map"][text],)
+            ).fetchone()
+        if not tractor:
+            await update.message.reply_text("Трактор больше не доступен. Выберите другой.")
+            return
+        await choose_job_field(update, dict(tractor))
+        return
+
     if state and state.get("mode") == "field" and text in state["map"]:
         field_id = state["map"][text]
 
@@ -751,7 +843,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ).fetchall()
             ]
 
-        flow[uid] = {"mode": "culture", "field": dict(field)}
+        flow[uid] = {
+            "mode": "culture", "field": dict(field), "tractor": state["tractor"]
+        }
         await update.message.reply_text(
             "🌱 Выберите культуру:",
             reply_markup=rows_kb(cultures)
@@ -799,12 +893,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = c.execute(
                 """INSERT INTO jobs(
                     user_id,field_id,field_name,field_area,culture,
-                    tank_volume,water_rate,status,started_at
-                ) VALUES(?,?,?,?,?,?,?,'active',?)""",
+                    tank_volume,water_rate,status,started_at,
+                    tractor_id,tractor_name,water_capacity_l
+                ) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?)""",
                 (
                     uid, field["id"], field["name"], field["area"],
                     state["culture"], state["tank"], value,
-                    local_now().isoformat(timespec="seconds")
+                    local_now().isoformat(timespec="seconds"),
+                    state["tractor"]["id"], state["tractor"]["name"],
+                    state["tractor"]["water_capacity_l"]
                 )
             )
             job_id = cur.lastrowid
@@ -1017,9 +1114,74 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "id": item_id,
             "old": dict(row)
         }
+        if table == "tractors":
+            flow[uid]["mode"] = "edit_tractor_menu"
+            await update.message.reply_text(
+                f"🚜 {row['name']} | Бочка {fmt(row['water_capacity_l'])} л\n"
+                "Что изменить?",
+                reply_markup=rows_kb(["Название", "Объём бочки"])
+            )
+            return
         await update.message.reply_text(
             f"✏️ Текущее название: {row['name']}\\n"
             "Введите новое название:"
+        )
+        return
+
+    if state and state.get("mode") == "edit_tractor_menu":
+        if text == "Название":
+            state["mode"] = "crud_edit_name"
+            await update.message.reply_text("Введите новое название трактора:")
+        elif text == "Объём бочки":
+            state["mode"] = "edit_tractor_capacity"
+            await update.message.reply_text("Введите новый объём бочки в литрах:")
+        else:
+            await update.message.reply_text("Выберите, что изменить, кнопкой.")
+        return
+
+    if state and state.get("mode") == "edit_tractor_capacity":
+        value = number(text)
+        if value is None or not math.isfinite(value) or value <= 0:
+            await update.message.reply_text("Введите положительный объём в литрах, например 6500.")
+            return
+        with db() as c:
+            c.execute("UPDATE tractors SET water_capacity_l=? WHERE id=?", (value, state["id"]))
+        flow[uid] = {"mode": "section", "table": "tractors"}
+        await update.message.reply_text(
+            f"✅ Объём бочки изменён: {fmt(value)} л.",
+            reply_markup=section_kb("tractors")
+        )
+        return
+
+    if state and state.get("mode") == "add_tractor_name":
+        if not text:
+            await update.message.reply_text("Введите название трактора.")
+            return
+        state["name"] = text
+        state["mode"] = "add_tractor_capacity"
+        await update.message.reply_text("Введите объём перевозимой воды в литрах, например 6500:")
+        return
+
+    if state and state.get("mode") == "add_tractor_capacity":
+        value = number(text)
+        if value is None or not math.isfinite(value) or value <= 0:
+            await update.message.reply_text("Введите положительный объём в литрах, например 6500.")
+            return
+        with db() as c:
+            try:
+                c.execute(
+                    "INSERT INTO tractors(name,water_capacity_l) VALUES(?,?)",
+                    (state["name"], value)
+                )
+            except sqlite3.IntegrityError:
+                c.execute(
+                    "UPDATE tractors SET active=1,water_capacity_l=? WHERE name=?",
+                    (value, state["name"])
+                )
+        flow[uid] = {"mode": "section", "table": "tractors"}
+        await update.message.reply_text(
+            f"✅ Трактор сохранён: {state['name']}, бочка {fmt(value)} л.",
+            reply_markup=section_kb("tractors")
         )
         return
 
@@ -1354,6 +1516,26 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_total(update, job)
         return
 
+    if text == BTN_PLANNED_REFILLS and job:
+        with db() as c:
+            recipe = c.execute(
+                "SELECT chemical_name,unit,rate_per_ha FROM recipes WHERE job_id=? ORDER BY id",
+                (job["id"],)
+            ).fetchall()
+            done = c.execute(
+                "SELECT COUNT(*) n FROM refills WHERE job_id=?", (job["id"],)
+            ).fetchone()["n"]
+        lines = planned_refills(job) + ["", f"✅ Уже сделано заправок: {done}"]
+        if recipe:
+            lines += ["", "🧪 ХИМИЯ НА ВСЁ ПОЛЕ:"]
+            for r in recipe:
+                lines.append(
+                    f"• {r['chemical_name']}: {fmt(r['rate_per_ha'])} {r['unit']}/га"
+                    f" → {fmt(float(job['field_area']) * r['rate_per_ha'])} {r['unit']}"
+                )
+        await update.message.reply_text("\n".join(lines), reply_markup=active_kb())
+        return
+
     if text == BTN_FINISH and job:
         flow[uid] = {"mode": "finish_residual"}
         await update.message.reply_text(
@@ -1520,7 +1702,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ---------- Админ-справочники ----------
-    if text in (BTN_FIELDS, BTN_CULTURES, BTN_CHEM, BTN_FILLERS):
+    if text in (BTN_FIELDS, BTN_CULTURES, BTN_CHEM, BTN_FILLERS, BTN_TRACTORS):
         if uid != ADMIN_ID:
             await update.message.reply_text("Этот раздел доступен администратору.")
             return
@@ -1530,6 +1712,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             BTN_CULTURES: "cultures",
             BTN_CHEM: "chemicals",
             BTN_FILLERS: "fillers",
+            BTN_TRACTORS: "tractors",
         }[text]
 
         flow[uid] = {"mode": "section", "table": table}
@@ -1572,6 +1755,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "WHERE active=1 ORDER BY name"
                     ).fetchall()
                     lines = [f"• {r['name']} | {r['unit']}" for r in rs]
+                elif table == "tractors":
+                    rs = c.execute(
+                        "SELECT name,water_capacity_l FROM tractors "
+                        "WHERE active=1 ORDER BY name"
+                    ).fetchall()
+                    lines = [
+                        f"• {r['name']} | Бочка {fmt(r['water_capacity_l'])} л"
+                        for r in rs
+                    ]
                 else:
                     rs = c.execute(
                         f"SELECT name FROM {table} WHERE active=1 ORDER BY name"
@@ -1604,7 +1796,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text == BTN_ADD:
-            if table == "fillers":
+            if table == "tractors":
+                flow[uid] = {"mode": "add_tractor_name"}
+                prompt = "Введите название трактора:"
+            elif table == "fillers":
                 flow[uid] = {"mode": "add_filler"}
                 prompt = "Введите имя заправщика:"
             elif table == "cultures":
