@@ -16,6 +16,10 @@ flow = {}
 # ---------------- КНОПКИ ----------------
 BTN_NEW = "➕ Новая работа"
 BTN_REPORTS = "📊 Итоги"
+BTN_CORRECT_LAST = "✏️ Исправить последнее"
+BTN_DELETE_JOB = "🗑 Удалить работу"
+BTN_CONFIRM_DELETE = "✅ Да, удалить"
+BTN_CANCEL_DELETE = "❌ Отмена"
 BTN_TODAY = "📆 За сегодня"
 BTN_BY_DATE = "🔎 По дате"
 BTN_BY_FIELD = "🌾 По полю"
@@ -191,6 +195,7 @@ def keyboard(rows):
 def main_kb():
     return keyboard([
         [BTN_NEW, BTN_REPORTS],
+        [BTN_CORRECT_LAST, BTN_DELETE_JOB],
         [BTN_FIELDS, BTN_CULTURES],
         [BTN_CHEM, BTN_FILLERS],
     ])
@@ -599,6 +604,38 @@ async def show_total(update, job):
         "\n".join(lines),
         reply_markup=active_kb()
     )
+
+
+def recalc_job_actuals(job_id):
+    """Пересчитать фактическую выработку всех закрытых заправок по цепочке остатков."""
+    with db() as c:
+        job = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        fills = c.execute(
+            "SELECT * FROM refills WHERE job_id=? ORDER BY seq,id",
+            (job_id,)
+        ).fetchall()
+        for f in fills:
+            if f["end_residual_l"] is None:
+                continue
+            actual = max(0.0, (float(f["total_solution_l"]) - float(f["end_residual_l"])) / float(job["water_rate"]))
+            c.execute(
+                "UPDATE refills SET actual_sprayed_ha=? WHERE id=?",
+                (actual, f["id"])
+            )
+
+
+def job_summary(job_id):
+    with db() as c:
+        job = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        total = c.execute(
+            "SELECT COALESCE(SUM(actual_sprayed_ha),0) s FROM refills WHERE job_id=?",
+            (job_id,)
+        ).fetchone()["s"]
+        recipe = c.execute(
+            "SELECT chemical_name,unit,rate_per_ha FROM recipes WHERE job_id=? ORDER BY id",
+            (job_id,)
+        ).fetchall()
+    return job, float(total or 0), recipe
 
 
 async def send_report(update, where_sql="", params=(), title="📊 ИТОГ"):
@@ -1262,6 +1299,136 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Если бак пустой — введите 0."
         )
         return
+
+    # ---------- Исправить последнее показание ----------
+    if text == BTN_CORRECT_LAST:
+        with db() as c:
+            last = c.execute(
+                """SELECT r.*, j.field_name, j.field_area, j.water_rate, j.id job_id
+                   FROM refills r JOIN jobs j ON j.id=r.job_id
+                   WHERE r.end_residual_l IS NOT NULL
+                   ORDER BY COALESCE(r.closed_at,r.created_at) DESC, r.id DESC
+                   LIMIT 1"""
+            ).fetchone()
+        if not last:
+            await update.message.reply_text("Нет завершённой заправки, которую можно исправить.")
+            return
+        flow[uid] = {
+            "mode": "correct_last_residual",
+            "refill_id": last["id"],
+            "job_id": last["job_id"],
+            "max_l": float(last["total_solution_l"])
+        }
+        await update.message.reply_text(
+            f"✏️ ИСПРАВИТЬ ПОСЛЕДНЕЕ\n\n"
+            f"🌾 Поле: {last['field_name']}\n"
+            f"🚿 Заправка №{last['seq']}\n"
+            f"💧 Сейчас записан остаток: {fmt(last['end_residual_l'])} л\n\n"
+            "Введите правильный остаток в литрах:"
+        )
+        return
+
+    if state and state.get("mode") == "correct_last_residual":
+        residual = number(text)
+        if residual is None or residual < 0:
+            await update.message.reply_text("Введите правильный остаток числом.")
+            return
+        if residual > state["max_l"] + 0.0001:
+            await update.message.reply_text(
+                f"Остаток не может быть больше {fmt(state['max_l'])} л."
+            )
+            return
+        with db() as c:
+            c.execute(
+                "UPDATE refills SET end_residual_l=? WHERE id=?",
+                (residual, state["refill_id"])
+            )
+        recalc_job_actuals(state["job_id"])
+        job, total, recipe = job_summary(state["job_id"])
+        left = max(0.0, float(job["field_area"]) - total)
+        lines = [
+            "✅ ПОКАЗАНИЕ ИСПРАВЛЕНО",
+            "",
+            f"🌾 Поле: {job['field_name']}",
+            f"📊 Всего обработано: {fmt(total)} га",
+            f"🌾 Осталось обработать: {fmt(left)} га",
+            f"💧 Исправленный остаток: {fmt(residual)} л",
+            "",
+            "🧪 Фактический расход химии:"
+        ]
+        for r in recipe:
+            lines.append(
+                f"• {r['chemical_name']} — {fmt(total * r['rate_per_ha'])} {r['unit']}"
+            )
+        flow.pop(uid, None)
+        await update.message.reply_text("\n".join(lines), reply_markup=main_kb())
+        return
+
+    # ---------- Удалить конкретную работу ----------
+    if text == BTN_DELETE_JOB:
+        today = local_now().strftime("%Y-%m-%d")
+        with db() as c:
+            rows = c.execute(
+                """SELECT j.id,j.field_name,j.started_at,
+                          COALESCE(SUM(r.actual_sprayed_ha),0) actual_ha
+                   FROM jobs j
+                   LEFT JOIN refills r ON r.job_id=j.id
+                   WHERE substr(j.started_at,1,10)=?
+                   GROUP BY j.id
+                   ORDER BY j.started_at DESC,j.id DESC""",
+                (today,)
+            ).fetchall()
+        if not rows:
+            await update.message.reply_text("За сегодня работ для удаления нет.")
+            return
+        mapping = {}
+        for r in rows:
+            try:
+                tm = datetime.fromisoformat(r["started_at"]).strftime("%H:%M")
+            except Exception:
+                tm = ""
+            label = f"{r['field_name']} | {fmt(r['actual_ha'])} га | {tm}"
+            mapping[label] = r["id"]
+        flow[uid] = {"mode": "delete_job_select", "map": mapping}
+        await update.message.reply_text(
+            "🗑 Выберите работу за сегодня, которую нужно удалить:",
+            reply_markup=rows_kb(mapping.keys())
+        )
+        return
+
+    if state and state.get("mode") == "delete_job_select" and text in state["map"]:
+        job_id = state["map"][text]
+        flow[uid] = {"mode": "delete_job_confirm", "job_id": job_id, "label": text}
+        await update.message.reply_text(
+            f"⚠️ Удалить эту работу полностью?\n\n{text}\n\n"
+            "Будут удалены её заправки и расчёты химии.",
+            reply_markup=keyboard([[BTN_CONFIRM_DELETE], [BTN_CANCEL_DELETE]])
+        )
+        return
+
+    if state and state.get("mode") == "delete_job_confirm":
+        if text == BTN_CANCEL_DELETE:
+            flow.pop(uid, None)
+            await update.message.reply_text("Удаление отменено.", reply_markup=main_kb())
+            return
+        if text == BTN_CONFIRM_DELETE:
+            job_id = state["job_id"]
+            with db() as c:
+                refill_ids = [r["id"] for r in c.execute(
+                    "SELECT id FROM refills WHERE job_id=?", (job_id,)
+                ).fetchall()]
+                if refill_ids:
+                    marks = ",".join("?" for _ in refill_ids)
+                    c.execute(f"DELETE FROM refill_chemicals WHERE refill_id IN ({marks})", refill_ids)
+                c.execute("DELETE FROM refills WHERE job_id=?", (job_id,))
+                c.execute("DELETE FROM recipes WHERE job_id=?", (job_id,))
+                c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            flow.pop(uid, None)
+            await update.message.reply_text(
+                "🗑 Работа полностью удалена. Поля, культуры, химия и заправщики сохранены.",
+                reply_markup=main_kb()
+            )
+            return
 
     # ---------- Итоги ----------
     if text == BTN_REPORTS:
