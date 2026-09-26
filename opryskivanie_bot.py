@@ -15,6 +15,11 @@ flow = {}
 
 # ---------------- КНОПКИ ----------------
 BTN_NEW = "➕ Новая работа"
+BTN_REPORTS = "📊 Итоги"
+BTN_TODAY = "📆 За сегодня"
+BTN_BY_DATE = "🔎 По дате"
+BTN_BY_FIELD = "🌾 По полю"
+BTN_SEASON = "🏆 За сезон"
 BTN_NEXT = "🚿 Следующая заправка"
 BTN_PARTIAL = "🎯 Заправка на площадь"
 BTN_TOTAL = "📊 Текущий итог"
@@ -112,7 +117,7 @@ def keyboard(rows):
 
 def main_kb():
     return keyboard([
-        [BTN_NEW],
+        [BTN_NEW, BTN_REPORTS],
         [BTN_FIELDS, BTN_CULTURES],
         [BTN_CHEM, BTN_FILLERS],
     ])
@@ -121,12 +126,28 @@ def main_kb():
 def active_kb():
     return keyboard([
         [BTN_NEXT, BTN_PARTIAL],
-        [BTN_TOTAL, BTN_FINISH],
+        [BTN_TOTAL, BTN_REPORTS],
+        [BTN_FINISH],
     ])
 
 
 def section_kb():
     return keyboard([[BTN_ADD, BTN_EDIT], [BTN_DELETE, BTN_LIST], [BTN_BACK]])
+
+
+def reports_kb():
+    return keyboard([
+        [BTN_TODAY, BTN_BY_DATE],
+        [BTN_BY_FIELD, BTN_SEASON],
+        [BTN_BACK],
+    ])
+
+
+def date_label(iso_text):
+    try:
+        return datetime.fromisoformat(iso_text).strftime("%d.%m.%Y")
+    except Exception:
+        return str(iso_text)[:10]
 
 
 def rows_kb(items, back=True):
@@ -499,6 +520,75 @@ async def show_total(update, job):
     )
 
 
+async def send_report(update, where_sql="", params=(), title="📊 ИТОГ"):
+    with db() as c:
+        jobs = c.execute(
+            f"""SELECT j.*,
+                       COALESCE(SUM(r.actual_sprayed_ha),0) actual_ha,
+                       COUNT(r.id) refill_count
+                FROM jobs j
+                LEFT JOIN refills r ON r.job_id=j.id
+                WHERE 1=1 {where_sql}
+                GROUP BY j.id
+                ORDER BY j.started_at, j.id""",
+            params
+        ).fetchall()
+
+    if not jobs:
+        await update.message.reply_text("Записей нет.", reply_markup=reports_kb())
+        return
+
+    lines = [title, ""]
+    total = 0.0
+    for j in jobs:
+        ha = float(j["actual_ha"] or 0)
+        total += ha
+        lines += [
+            f"📅 {date_label(j['started_at'])}",
+            f"🌾 {j['field_name']} | {j['culture']}",
+            f"🚜 Обработано: {fmt(ha)} га",
+            f"🚿 Заправок: {j['refill_count']}",
+            ""
+        ]
+    lines.append(f"📊 ВСЕГО: {fmt(total)} га")
+    await update.message.reply_text("\n".join(lines), reply_markup=reports_kb())
+
+
+async def choose_report_date(update):
+    uid = update.effective_user.id
+    with db() as c:
+        rs = c.execute(
+            """SELECT DISTINCT substr(started_at,1,10) d
+               FROM jobs ORDER BY d DESC LIMIT 60"""
+        ).fetchall()
+    mapping = {}
+    for r in rs:
+        try:
+            label = datetime.fromisoformat(r["d"]).strftime("%d.%m.%Y")
+        except Exception:
+            label = r["d"]
+        mapping[label] = r["d"]
+    flow[uid] = {"mode": "report_date", "map": mapping}
+    await update.message.reply_text(
+        "📅 Выберите дату, по которой уже есть работа:",
+        reply_markup=rows_kb(mapping.keys())
+    )
+
+
+async def choose_report_field(update):
+    uid = update.effective_user.id
+    with db() as c:
+        rs = c.execute(
+            "SELECT DISTINCT field_name FROM jobs ORDER BY field_name"
+        ).fetchall()
+    names = [r["field_name"] for r in rs]
+    flow[uid] = {"mode": "report_field", "fields": names}
+    await update.message.reply_text(
+        "🌾 Выберите поле:",
+        reply_markup=rows_kb(names)
+    )
+
+
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -683,9 +773,17 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(closed["error"])
             return
         if closed:
+            with db() as c:
+                total_done = c.execute(
+                    "SELECT COALESCE(SUM(actual_sprayed_ha),0) s FROM refills WHERE job_id=?",
+                    (job["id"],)
+                ).fetchone()["s"]
+            left = max(0.0, job["field_area"] - total_done)
             await update.message.reply_text(
                 f"✅ Предыдущая заправка №{closed['seq']} завершена.\n"
-                f"🚜 Выработано: {fmt(closed['actual_ha'])} га\n"
+                f"🚜 За заправку: {fmt(closed['actual_ha'])} га\n"
+                f"📊 Всего обработано: {fmt(total_done)} га\n"
+                f"🌾 Осталось обработать: {fmt(left)} га\n"
                 f"💧 Использовано раствора: {fmt(closed['used_l'])} л\n"
                 f"💧 Остаток: {fmt(residual)} л"
             )
@@ -737,9 +835,17 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(closed["error"])
             return
         if closed:
+            with db() as c:
+                total_done = c.execute(
+                    "SELECT COALESCE(SUM(actual_sprayed_ha),0) s FROM refills WHERE job_id=?",
+                    (job["id"],)
+                ).fetchone()["s"]
+            left = max(0.0, job["field_area"] - total_done)
             await update.message.reply_text(
                 f"✅ Предыдущая заправка №{closed['seq']} завершена.\n"
-                f"🚜 Выработано: {fmt(closed['actual_ha'])} га\n"
+                f"🚜 За заправку: {fmt(closed['actual_ha'])} га\n"
+                f"📊 Всего обработано: {fmt(total_done)} га\n"
+                f"🌾 Осталось обработать: {fmt(left)} га\n"
                 f"💧 Использовано раствора: {fmt(closed['used_l'])} л\n"
                 f"💧 Остаток: {fmt(residual)} л"
             )
@@ -966,6 +1072,28 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Поле добавлено.", reply_markup=section_kb())
         return
 
+    # ---------- Итоги: выбор активной даты / поля ----------
+    if state and state.get("mode") == "report_date" and text in state["map"]:
+        d = state["map"][text]
+        flow.pop(uid, None)
+        await send_report(
+            update,
+            " AND substr(j.started_at,1,10)=?",
+            (d,),
+            f"🔎 ИТОГ ЗА {text}"
+        )
+        return
+
+    if state and state.get("mode") == "report_field" and text in state["fields"]:
+        flow.pop(uid, None)
+        await send_report(
+            update,
+            " AND j.field_name=?",
+            (text,),
+            f"🌾 ИТОГ ПО ПОЛЮ: {text}"
+        )
+        return
+
     # ---------- Завершение: остаток последней заправки ----------
     if state and state.get("mode") == "finish_residual":
         residual = number(text)
@@ -1053,6 +1181,32 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Если бак пустой — введите 0."
         )
         return
+
+    # ---------- Итоги ----------
+    if text == BTN_REPORTS:
+        flow[uid] = {"mode": "reports"}
+        await update.message.reply_text("📊 ИТОГИ", reply_markup=reports_kb())
+        return
+
+    if state and state.get("mode") == "reports":
+        if text == BTN_TODAY:
+            today = local_now().strftime("%Y-%m-%d")
+            await send_report(
+                update,
+                " AND substr(j.started_at,1,10)=?",
+                (today,),
+                "📆 ИТОГ ЗА СЕГОДНЯ"
+            )
+            return
+        if text == BTN_BY_DATE:
+            await choose_report_date(update)
+            return
+        if text == BTN_BY_FIELD:
+            await choose_report_field(update)
+            return
+        if text == BTN_SEASON:
+            await send_report(update, "", (), "🏆 ИТОГ ЗА СЕЗОН")
+            return
 
     # ---------- Админ-справочники ----------
     if text in (BTN_FIELDS, BTN_CULTURES, BTN_CHEM, BTN_FILLERS):
