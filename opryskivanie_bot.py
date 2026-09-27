@@ -389,8 +389,9 @@ def planned_refills(job):
     """Полный план по полю: заправки бака и подвоз воды считаются отдельно."""
     total_water = float(job["field_area"]) * float(job["water_rate"])
     tank = float(job["tank_volume"])
-    count = math.ceil(total_water / tank - 1e-10)
-    last_tank = total_water - tank * (count - 1)
+    fills = total_water / tank
+    full_fills = math.ceil(fills - 1e-10)
+    last_tank = total_water - tank * (full_fills - 1)
     lines = [
         "🧮 ПЛАН ЗАПРАВОК НА ВСЁ ПОЛЕ", "",
         f"🌾 {job['field_name']} | {job['culture']}",
@@ -398,16 +399,17 @@ def planned_refills(job):
         f"💧 Норма воды: {fmt(job['water_rate'])} л/га",
         f"💧 Всего раствора: {fmt(total_water)} л",
         f"🚿 Бак опрыскивателя: {fmt(tank)} л",
-        f"🚿 Заправок опрыскивателя: {count}",
+        f"🚿 Заправок опрыскивателя: {fills:.1f}".replace(".", ","),
         f"Последняя заправка: {fmt(last_tank)} л",
     ]
     capacity = job["water_capacity_l"]
     if capacity and capacity > 0:
-        loads = math.ceil(total_water / capacity - 1e-10)
-        last_load = total_water - capacity * (loads - 1)
+        loads = total_water / capacity
+        full_loads = math.ceil(loads - 1e-10)
+        last_load = total_water - capacity * (full_loads - 1)
         lines += [
             "", f"🚜 {job['tractor_name']} | Вода в прицепе: {fmt(capacity)} л",
-            f"🛢 Подвозов воды: {loads}",
+            f"🛢 Подвозов воды: {loads:.1f}".replace(".", ","),
             f"Последний подвоз: {fmt(last_load)} л",
         ]
         full_tanks = int(capacity // tank)
