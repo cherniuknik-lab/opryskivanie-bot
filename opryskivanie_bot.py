@@ -17,6 +17,7 @@ flow = {}
 # ---------------- КНОПКИ ----------------
 BTN_NEW = "➕ Новая работа"
 BTN_REPORTS = "📊 Итоги"
+BTN_REFILL_HISTORY = "📚 История заправок"
 BTN_CORRECT_LAST = "✏️ Исправить последнее"
 BTN_DELETE_JOB = "🗑 Удалить работу"
 BTN_CONFIRM_DELETE = "✅ Да, удалить"
@@ -199,6 +200,7 @@ def keyboard(rows):
 def main_kb():
     return keyboard([
         [BTN_NEW, BTN_REPORTS],
+        [BTN_REFILL_HISTORY],
         [BTN_CORRECT_LAST, BTN_DELETE_JOB],
         [BTN_FIELDS, BTN_CULTURES],
         [BTN_CHEM, BTN_FILLERS],
@@ -210,7 +212,7 @@ def active_kb():
     return keyboard([
         [BTN_NEXT, BTN_PARTIAL],
         [BTN_TOTAL, BTN_PLANNED_REFILLS],
-        [BTN_REPORTS],
+        [BTN_REPORTS, BTN_REFILL_HISTORY],
         [BTN_FINISH],
     ])
 
@@ -822,6 +824,108 @@ async def choose_report_field(update):
     )
 
 
+async def choose_refill_history_field(update):
+    uid = update.effective_user.id
+    with db() as c:
+        rows = c.execute(
+            """SELECT DISTINCT j.field_name
+               FROM refills r JOIN jobs j ON j.id=r.job_id
+               ORDER BY j.field_name"""
+        ).fetchall()
+    names = [r["field_name"] for r in rows]
+    if not names:
+        await update.message.reply_text(
+            "Сохранённых заправок пока нет.",
+            reply_markup=active_kb() if active_job(uid) else main_kb()
+        )
+        return
+    flow[uid] = {"mode": "history_field", "fields": names}
+    await update.message.reply_text(
+        "📚 История заправок\nВыберите поле:",
+        reply_markup=rows_kb(names)
+    )
+
+
+async def choose_refill_history_date(update, field_name):
+    uid = update.effective_user.id
+    with db() as c:
+        rows = c.execute(
+            """SELECT DISTINCT substr(r.created_at,1,10) day
+               FROM refills r JOIN jobs j ON j.id=r.job_id
+               WHERE j.field_name=? ORDER BY day DESC""",
+            (field_name,)
+        ).fetchall()
+    mapping = {date_label(r["day"]): r["day"] for r in rows}
+    if not mapping:
+        await choose_refill_history_field(update)
+        return
+    flow[uid] = {"mode": "history_date", "field": field_name, "dates": mapping}
+    await update.message.reply_text(
+        f"🌾 {field_name}\nВыберите дату заправок:",
+        reply_markup=rows_kb(mapping.keys())
+    )
+
+
+async def show_refill_history(update, field_name, day, dates):
+    with db() as c:
+        rows = c.execute(
+            """SELECT r.*,j.field_name,j.culture,j.water_rate
+               FROM refills r JOIN jobs j ON j.id=r.job_id
+               WHERE j.field_name=? AND substr(r.created_at,1,10)=?
+               ORDER BY r.created_at,r.id""",
+            (field_name, day)
+        ).fetchall()
+        chemicals = {}
+        for r in rows:
+            chemicals[r["id"]] = c.execute(
+                """SELECT chemical_name,unit,amount FROM refill_chemicals
+                   WHERE refill_id=? ORDER BY id""",
+                (r["id"],)
+            ).fetchall()
+
+    lines = [f"📚 ЗАПРАВКИ: {field_name}", f"📅 {date_label(day)}", ""]
+    total_water = 0.0
+    total_ha = 0.0
+    for r in rows:
+        total_water += float(r["water_to_add_l"])
+        total_ha += float(r["actual_sprayed_ha"] or 0)
+        try:
+            time = datetime.fromisoformat(r["created_at"]).strftime("%H:%M")
+        except (ValueError, TypeError):
+            time = "—"
+        lines += [
+            f"🚿 ЗАПРАВКА №{r['seq']} | {time}",
+            f"🌱 Культура: {r['culture']}",
+            f"👤 Заправщик: {r['filler_name']}",
+            f"🎯 Приготовлено на: {fmt(r['target_ha'])} га",
+            (f"🚜 Обработано: {fmt(r['actual_sprayed_ha'])} га"
+             if r["actual_sprayed_ha"] is not None else "🚜 Обработка ещё не завершена"),
+            f"💧 Раствора в баке: {fmt(r['total_solution_l'])} л",
+            f"💧 Остаток перед заправкой: {fmt(r['residual_l'])} л",
+            f"➕ Долито воды: {fmt(r['water_to_add_l'])} л",
+        ]
+        if r["end_residual_l"] is not None:
+            lines.append(f"💧 Остаток после обработки: {fmt(r['end_residual_l'])} л")
+        if chemicals[r["id"]]:
+            lines.append("🧪 Добавлено химии:")
+            for chem in chemicals[r["id"]]:
+                lines.append(f"• {chem['chemical_name']} — {fmt(chem['amount'])} {chem['unit']}")
+        lines.append("")
+    lines += [
+        f"🚿 Всего заправок за дату: {len(rows)}",
+        f"💧 Долито воды: {fmt(total_water)} л",
+        f"🚜 Обработано: {fmt(total_ha)} га",
+    ]
+    # Длинную историю разбиваем на сообщения в пределах лимита Telegram.
+    page = []
+    for line in lines:
+        if page and len("\n".join(page)) + len(line) + 1 > 3800:
+            await update.message.reply_text("\n".join(page))
+            page = [f"📚 ЗАПРАВКИ: {field_name} | {date_label(day)} (продолжение)", ""]
+        page.append(line)
+    await update.message.reply_text("\n".join(page), reply_markup=rows_kb(dates.keys()))
+
+
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -840,11 +944,26 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == BTN_BACK:
+        if state and state.get("mode") == "history_date":
+            await choose_refill_history_field(update)
+            return
         flow.pop(uid, None)
         await update.message.reply_text(
             "Главное меню.",
             reply_markup=active_kb() if job else main_kb()
         )
+        return
+
+    if text == BTN_REFILL_HISTORY:
+        await choose_refill_history_field(update)
+        return
+
+    if state and state.get("mode") == "history_field" and text in state["fields"]:
+        await choose_refill_history_date(update, text)
+        return
+
+    if state and state.get("mode") == "history_date" and text in state["dates"]:
+        await show_refill_history(update, state["field"], state["dates"][text], state["dates"])
         return
 
     # ---------- Создание новой работы ----------
