@@ -37,6 +37,11 @@ BTN_CULTURES = "🌱 Культуры"
 BTN_CHEM = "🧪 Химия"
 BTN_FILLERS = "👤 Заправщики"
 BTN_TRACTORS = "🚜 Тракторы"
+BTN_ADMINS = "👑 Администраторы"
+BTN_ADD_ADMIN = "➕ Добавить администратора"
+BTN_REMOVE_ADMIN = "🗑 Удалить администратора"
+BTN_LIST_ADMINS = "📋 Список администраторов"
+BTN_CONFIRM_REMOVE_ADMIN = "✅ Да, удалить администратора"
 
 BTN_ADD = "➕ Добавить"
 BTN_EDIT = "✏️ Изменить"
@@ -197,23 +202,36 @@ def keyboard(rows):
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
-def main_kb():
-    return keyboard([
+def main_kb(uid=None):
+    rows = [
         [BTN_NEW, BTN_REPORTS],
         [BTN_REFILL_HISTORY],
         [BTN_CORRECT_LAST, BTN_DELETE_JOB],
         [BTN_FIELDS, BTN_CULTURES],
         [BTN_CHEM, BTN_FILLERS],
         [BTN_TRACTORS],
-    ])
+    ]
+    if uid is not None and is_admin(uid):
+        rows.append([BTN_ADMINS])
+    return keyboard(rows)
 
 
-def active_kb():
-    return keyboard([
+def active_kb(uid=None):
+    rows = [
         [BTN_NEXT, BTN_PARTIAL],
         [BTN_TOTAL, BTN_PLANNED_REFILLS],
         [BTN_REPORTS, BTN_REFILL_HISTORY],
         [BTN_FINISH],
+    ]
+    if uid is not None and is_admin(uid):
+        rows.append([BTN_ADMINS])
+    return keyboard(rows)
+
+
+def admins_kb():
+    return keyboard([
+        [BTN_ADD_ADMIN], [BTN_REMOVE_ADMIN],
+        [BTN_LIST_ADMINS], [BTN_BACK],
     ])
 
 
@@ -284,6 +302,16 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1
         );
 
+        CREATE TABLE IF NOT EXISTS bot_admins(
+            user_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_users(
+            user_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS jobs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -339,6 +367,9 @@ def init_db():
             ("tractor_id", "INTEGER"),
             ("tractor_name", "TEXT"),
             ("water_capacity_l", "REAL"),
+            ("entered_by_id", "INTEGER"),
+            ("entered_by_name", "TEXT"),
+            ("entered_by_role", "TEXT"),
         ]:
             if col not in job_cols:
                 c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
@@ -347,6 +378,12 @@ def init_db():
             ("end_residual_l", "REAL"),
             ("actual_sprayed_ha", "REAL"),
             ("closed_at", "TEXT"),
+            ("entered_by_id", "INTEGER"),
+            ("entered_by_name", "TEXT"),
+            ("entered_by_role", "TEXT"),
+            ("closed_by_id", "INTEGER"),
+            ("closed_by_name", "TEXT"),
+            ("closed_by_role", "TEXT"),
         ]:
             if col not in refill_cols:
                 c.execute(f"ALTER TABLE refills ADD COLUMN {col} {ddl}")
@@ -387,6 +424,50 @@ def active_job(uid):
         ).fetchone()
 
 
+def is_admin(uid):
+    if ADMIN_ID and uid == ADMIN_ID:
+        return True
+    with db() as c:
+        return c.execute(
+            "SELECT 1 FROM bot_admins WHERE user_id=?", (uid,)
+        ).fetchone() is not None
+
+
+def display_name(update):
+    user = update.effective_user
+    return (" ".join(filter(None, [user.first_name, user.last_name])).strip()
+            or user.username or str(user.id))
+
+
+def remember_user(update):
+    with db() as c:
+        c.execute(
+            """INSERT INTO bot_users(user_id,name) VALUES(?,?)
+               ON CONFLICT(user_id) DO UPDATE SET name=excluded.name""",
+            (update.effective_user.id, display_name(update))
+        )
+
+
+def entry_actor(update):
+    uid = update.effective_user.id
+    return uid, display_name(update), "администратор" if is_admin(uid) else "пользователь"
+
+
+def actor_label(actor_id, saved_name, saved_role, known_users):
+    if actor_id is None:
+        return "не зафиксировано"
+    name = saved_name or known_users.get(actor_id) or f"ID {actor_id}"
+    role = saved_role or ("администратор" if actor_id == ADMIN_ID else "")
+    return f"{role} {name}" if role else name
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    remember_user(update)
+    await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
+
+
 def planned_refills(job):
     """Полный план по полю: заправки бака и подвоз воды считаются отдельно."""
     total_water = float(job["field_area"]) * float(job["water_rate"])
@@ -424,11 +505,18 @@ def planned_refills(job):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    remember_user(update)
+    if is_admin(uid) and uid != ADMIN_ID:
+        name = " ".join(filter(None, [update.effective_user.first_name,
+                                       update.effective_user.last_name]))
+        with db() as c:
+            c.execute("UPDATE bot_admins SET name=? WHERE user_id=?", (name, uid))
     job = active_job(update.effective_user.id)
     await update.message.reply_text(
         "🚿 ОПРЫСКИВАНИЕ\n\n"
         + ("Есть активная работа." if job else "Готов к работе."),
-        reply_markup=active_kb() if job else main_kb()
+        reply_markup=active_kb(uid) if job else main_kb(uid)
     )
 
 
@@ -442,7 +530,7 @@ async def begin_job(update):
     if not rs:
         await update.message.reply_text(
             "Сначала добавьте трактор и объём его бочки в разделе «🚜 Тракторы».",
-            reply_markup=main_kb()
+            reply_markup=main_kb(uid)
         )
         return
 
@@ -483,7 +571,7 @@ async def choose_chemical(update, job_id):
     )
 
 
-def close_previous_refill(job, residual):
+def close_previous_refill(job, residual, update):
     """Закрывает предыдущую незакрытую заправку по остатку перед новой."""
     with db() as c:
         prev = c.execute(
@@ -504,14 +592,17 @@ def close_previous_refill(job, residual):
 
         used_l = max(0.0, prev["total_solution_l"] - residual)
         actual_ha = used_l / job["water_rate"]
+        actor_id, actor_name, actor_role = entry_actor(update)
 
         c.execute(
             """UPDATE refills
-               SET end_residual_l=?, actual_sprayed_ha=?, closed_at=?
+               SET end_residual_l=?, actual_sprayed_ha=?, closed_at=?,
+                   closed_by_id=?,closed_by_name=?,closed_by_role=?
                WHERE id=?""",
             (
                 residual, actual_ha,
                 local_now().isoformat(timespec="seconds"),
+                actor_id, actor_name, actor_role,
                 prev["id"]
             )
         )
@@ -540,7 +631,7 @@ async def choose_filler(update, refill_type, target_ha, residual):
         flow.pop(uid, None)
         await update.message.reply_text(
             "⚠️ Сначала добавьте хотя бы одного заправщика.",
-            reply_markup=active_kb()
+            reply_markup=active_kb(uid)
         )
         return
 
@@ -574,6 +665,7 @@ async def save_refill(update, job, refill_type, target_ha, residual, filler):
         water_to_add = max(0.0, total_solution - residual)
 
     with db() as c:
+        actor_id, actor_name, actor_role = entry_actor(update)
         seq = c.execute(
             "SELECT COALESCE(MAX(seq),0)+1 n FROM refills WHERE job_id=?",
             (job["id"],)
@@ -582,12 +674,14 @@ async def save_refill(update, job, refill_type, target_ha, residual, filler):
         cur = c.execute(
             """INSERT INTO refills(
                 job_id,seq,refill_type,target_ha,residual_l,
-                total_solution_l,water_to_add_l,filler_name,created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                total_solution_l,water_to_add_l,filler_name,created_at,
+                entered_by_id,entered_by_name,entered_by_role
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 job["id"], seq, refill_type, target_ha, residual,
                 total_solution, water_to_add, filler,
-                local_now().isoformat(timespec="seconds")
+                local_now().isoformat(timespec="seconds"),
+                actor_id, actor_name, actor_role
             )
         )
         refill_id = cur.lastrowid
@@ -648,7 +742,7 @@ async def save_refill(update, job, refill_type, target_ha, residual, filler):
 
     await update.message.reply_text(
         "\n".join(lines),
-        reply_markup=active_kb()
+        reply_markup=active_kb(update.effective_user.id)
     )
 
 
@@ -692,7 +786,7 @@ async def show_total(update, job):
 
     await update.message.reply_text(
         "\n".join(lines),
-        reply_markup=active_kb()
+        reply_markup=active_kb(update.effective_user.id)
     )
 
 
@@ -745,10 +839,22 @@ async def send_report(update, where_sql="", params=(), title="📊 ИТОГ"):
         # Рецепт сохраняется вместе с работой: последующие изменения списка
         # препаратов не должны менять историю обработки по датам.
         recipes = {}
+        refill_authors = {}
+        known_users = {
+            r["user_id"]: r["name"] for r in c.execute(
+                "SELECT user_id,name FROM bot_users"
+            ).fetchall()
+        }
         for j in jobs:
             recipes[j["id"]] = c.execute(
                 """SELECT chemical_name,unit,rate_per_ha
                    FROM recipes WHERE job_id=? ORDER BY id""",
+                (j["id"],)
+            ).fetchall()
+            refill_authors[j["id"]] = c.execute(
+                """SELECT entered_by_id,entered_by_name,entered_by_role,
+                          closed_by_id,closed_by_name,closed_by_role
+                   FROM refills WHERE job_id=? ORDER BY seq,id""",
                 (j["id"],)
             ).fetchall()
 
@@ -775,6 +881,34 @@ async def send_report(update, where_sql="", params=(), title="📊 ИТОГ"):
                     f"{fmt(ha * r['rate_per_ha'])} {r['unit']} "
                     f"({fmt(r['rate_per_ha'])} {r['unit']}/га)"
                 )
+        creator = actor_label(
+            j["entered_by_id"] or j["user_id"], j["entered_by_name"],
+            j["entered_by_role"], known_users
+        )
+        authors = []
+        for r in refill_authors[j["id"]]:
+            for prefix in ("entered", "closed"):
+                author_id = r[f"{prefix}_by_id"]
+                if author_id is not None:
+                    author = actor_label(
+                        author_id, r[f"{prefix}_by_name"],
+                        r[f"{prefix}_by_role"], known_users
+                    )
+                    if author not in authors:
+                        authors.append(author)
+        if authors:
+            if creator not in authors:
+                lines.append(f"👤 Задание создал: {creator}")
+            lines.append(
+                f"👤 Данные {'ввёл' if len(authors) == 1 else 'ввели'}: "
+                + ", ".join(authors)
+            )
+            if any(r["entered_by_id"] is None for r in refill_authors[j["id"]]):
+                lines.append("👤 Кто ввёл часть старых заправок: не зафиксировано")
+        else:
+            lines.append(f"👤 Задание создал: {creator}")
+            if j["refill_count"]:
+                lines.append("👤 Кто ввёл старые заправки: не зафиксировано")
         lines.append("")
     lines.append(f"📊 ВСЕГО: {fmt(total)} га")
     # Telegram ограничивает сообщение 4096 символами. Длинные отчёты
@@ -836,7 +970,7 @@ async def choose_refill_history_field(update):
     if not names:
         await update.message.reply_text(
             "Сохранённых заправок пока нет.",
-            reply_markup=active_kb() if active_job(uid) else main_kb()
+            reply_markup=active_kb(uid) if active_job(uid) else main_kb(uid)
         )
         return
     flow[uid] = {"mode": "history_field", "fields": names}
@@ -875,6 +1009,11 @@ async def show_refill_history(update, field_name, day, dates):
                ORDER BY r.created_at,r.id""",
             (field_name, day)
         ).fetchall()
+        known_users = {
+            row["user_id"]: row["name"] for row in c.execute(
+                "SELECT user_id,name FROM bot_users"
+            ).fetchall()
+        }
         chemicals = {}
         for r in rows:
             chemicals[r["id"]] = c.execute(
@@ -910,6 +1049,19 @@ async def show_refill_history(update, field_name, day, dates):
             lines.append("🧪 Добавлено химии:")
             for chem in chemicals[r["id"]]:
                 lines.append(f"• {chem['chemical_name']} — {fmt(chem['amount'])} {chem['unit']}")
+        lines.append(
+            "👤 Заправку ввёл: " + actor_label(
+                r["entered_by_id"], r["entered_by_name"],
+                r["entered_by_role"], known_users
+            )
+        )
+        if r["closed_by_id"] is not None:
+            closer = actor_label(
+                r["closed_by_id"], r["closed_by_name"],
+                r["closed_by_role"], known_users
+            )
+            if r["closed_by_id"] != r["entered_by_id"]:
+                lines.append(f"👤 Результат ввёл: {closer}")
         lines.append("")
     lines += [
         f"🚿 Всего заправок за дату: {len(rows)}",
@@ -931,15 +1083,30 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
+    remember_user(update)
     text = update.message.text.strip()
     state = flow.get(uid)
     job = active_job(uid)
+
+    admin_edit_modes = {
+        "add_filler", "add_culture", "add_chemical_name", "add_chemical_unit",
+        "add_field_name", "add_field_area", "add_field_culture",
+        "add_tractor_name", "add_tractor_capacity", "edit_tractor_menu",
+        "edit_tractor_capacity", "field_culture_select", "field_culture_choose",
+    }
+    if state and not is_admin(uid) and (
+        state.get("table") in ("fields", "cultures", "chemicals", "fillers", "tractors")
+        or state.get("mode") in admin_edit_modes
+    ):
+        flow.pop(uid, None)
+        await update.message.reply_text("Права администратора больше не доступны.")
+        return
 
     if text == BTN_CANCEL:
         flow.pop(uid, None)
         await update.message.reply_text(
             "Отменено.",
-            reply_markup=active_kb() if job else main_kb()
+            reply_markup=active_kb(uid) if job else main_kb(uid)
         )
         return
 
@@ -950,9 +1117,99 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flow.pop(uid, None)
         await update.message.reply_text(
             "Главное меню.",
-            reply_markup=active_kb() if job else main_kb()
+            reply_markup=active_kb(uid) if job else main_kb(uid)
         )
         return
+
+    # ---------- Дополнительные администраторы ----------
+    if text == BTN_ADMINS:
+        if not is_admin(uid):
+            await update.message.reply_text("Этот раздел доступен администраторам.")
+            return
+        flow[uid] = {"mode": "admins_menu"}
+        await update.message.reply_text("👑 Администраторы", reply_markup=admins_kb())
+        return
+
+    if state and state.get("mode", "").startswith("admin"):
+        if not is_admin(uid):
+            flow.pop(uid, None)
+            await update.message.reply_text("Права администратора больше не доступны.")
+            return
+        if state["mode"] == "admins_menu":
+            if text == BTN_ADD_ADMIN:
+                flow[uid] = {"mode": "admin_add_id"}
+                await update.message.reply_text(
+                    "Попросите человека открыть личный чат с ботом и отправить /id.\n"
+                    "Введите полученный Telegram ID (только цифры):"
+                )
+                return
+            if text == BTN_LIST_ADMINS:
+                with db() as c:
+                    admins = c.execute(
+                        "SELECT user_id,name FROM bot_admins ORDER BY name,user_id"
+                    ).fetchall()
+                lines = ["👑 АДМИНИСТРАТОРЫ", ""]
+                if ADMIN_ID:
+                    lines.append(f"• Основной — {ADMIN_ID}")
+                for admin in admins:
+                    lines.append(f"• {admin['name'] or 'Администратор'} — {admin['user_id']}")
+                await update.message.reply_text("\n".join(lines), reply_markup=admins_kb())
+                return
+            if text == BTN_REMOVE_ADMIN:
+                with db() as c:
+                    admins = c.execute(
+                        "SELECT user_id,name FROM bot_admins ORDER BY name,user_id"
+                    ).fetchall()
+                if not admins:
+                    await update.message.reply_text(
+                        "Дополнительных администраторов нет.", reply_markup=admins_kb()
+                    )
+                    return
+                mapping = {
+                    f"{a['name'] or 'Администратор'} | ID {a['user_id']}": a["user_id"]
+                    for a in admins
+                }
+                flow[uid] = {"mode": "admin_remove_select", "map": mapping}
+                await update.message.reply_text(
+                    "Кого удалить из администраторов?", reply_markup=rows_kb(mapping.keys())
+                )
+                return
+        if state["mode"] == "admin_add_id":
+            if not text.isdecimal() or int(text) <= 0:
+                await update.message.reply_text("Введите Telegram ID цифрами. Его показывает команда /id.")
+                return
+            new_id = int(text)
+            if new_id == ADMIN_ID:
+                await update.message.reply_text("Это уже основной администратор.")
+                return
+            with db() as c:
+                exists = c.execute("SELECT 1 FROM bot_admins WHERE user_id=?", (new_id,)).fetchone()
+                if not exists:
+                    c.execute("INSERT INTO bot_admins(user_id) VALUES(?)", (new_id,))
+            flow[uid] = {"mode": "admins_menu"}
+            await update.message.reply_text(
+                ("Этот человек уже администратор.\n" if exists else "✅ Администратор добавлен.\n")
+                + f"Telegram ID: {new_id}\n"
+                "Пусть он отправит боту /start в личном чате.",
+                reply_markup=admins_kb()
+            )
+            return
+        if state["mode"] == "admin_remove_select" and text in state["map"]:
+            flow[uid] = {"mode": "admin_remove_confirm", "id": state["map"][text]}
+            await update.message.reply_text(
+                f"Удалить права администратора у {text}?",
+                reply_markup=keyboard([[BTN_CONFIRM_REMOVE_ADMIN], [BTN_CANCEL]])
+            )
+            return
+        if state["mode"] == "admin_remove_confirm" and text == BTN_CONFIRM_REMOVE_ADMIN:
+            with db() as c:
+                c.execute("DELETE FROM bot_admins WHERE user_id=?", (state["id"],))
+            flow[uid] = {"mode": "admins_menu"} if is_admin(uid) else {}
+            await update.message.reply_text(
+                "✅ Права администратора удалены.",
+                reply_markup=admins_kb() if is_admin(uid) else main_kb(uid)
+            )
+            return
 
     if text == BTN_REFILL_HISTORY:
         await choose_refill_history_field(update)
@@ -1036,20 +1293,23 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         field = state["field"]
+        actor_id, actor_name, actor_role = entry_actor(update)
 
         with db() as c:
             cur = c.execute(
                 """INSERT INTO jobs(
                     user_id,field_id,field_name,field_area,culture,
                     tank_volume,water_rate,status,started_at,
-                    tractor_id,tractor_name,water_capacity_l
-                ) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?)""",
+                    tractor_id,tractor_name,water_capacity_l,
+                    entered_by_id,entered_by_name,entered_by_role
+                ) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?)""",
                 (
                     uid, field["id"], field["name"], field["area"],
                     state["culture"], state["tank"], value,
                     local_now().isoformat(timespec="seconds"),
                     state["tractor"]["id"], state["tractor"]["name"],
-                    state["tractor"]["water_capacity_l"]
+                    state["tractor"]["water_capacity_l"],
+                    actor_id, actor_name, actor_role
                 )
             )
             job_id = cur.lastrowid
@@ -1136,7 +1396,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        closed = close_previous_refill(job, residual)
+        closed = close_previous_refill(job, residual, update)
         if closed and closed.get("error"):
             await update.message.reply_text(closed["error"])
             return
@@ -1198,7 +1458,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        closed = close_previous_refill(job, residual)
+        closed = close_previous_refill(job, residual, update)
         if closed and closed.get("error"):
             await update.message.reply_text(closed["error"])
             return
@@ -1593,7 +1853,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         job = active_job(uid)
-        closed = close_previous_refill(job, residual)
+        closed = close_previous_refill(job, residual, update)
         if closed and closed.get("error"):
             await update.message.reply_text(closed["error"])
             return
@@ -1629,7 +1889,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         flow.pop(uid, None)
-        await update.message.reply_text("\n".join(lines), reply_markup=main_kb())
+        await update.message.reply_text("\n".join(lines), reply_markup=main_kb(uid))
         return
 
     # ---------- Основные кнопки ----------
@@ -1637,7 +1897,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if job:
             await update.message.reply_text(
                 "Сначала завершите текущее поле.",
-                reply_markup=active_kb()
+                reply_markup=active_kb(uid)
             )
         else:
             await begin_job(update)
@@ -1681,7 +1941,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"• {r['chemical_name']}: {fmt(r['rate_per_ha'])} {r['unit']}/га"
                     f" → {fmt(float(job['field_area']) * r['rate_per_ha'])} {r['unit']}"
                 )
-        await update.message.reply_text("\n".join(lines), reply_markup=active_kb())
+        await update.message.reply_text("\n".join(lines), reply_markup=active_kb(uid))
         return
 
     if text == BTN_FINISH and job:
@@ -1732,9 +1992,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         with db() as c:
+            actor_id, actor_name, actor_role = entry_actor(update)
             c.execute(
-                "UPDATE refills SET end_residual_l=? WHERE id=?",
-                (residual, state["refill_id"])
+                """UPDATE refills SET end_residual_l=?,closed_by_id=?,
+                   closed_by_name=?,closed_by_role=? WHERE id=?""",
+                (residual, actor_id, actor_name, actor_role, state["refill_id"])
             )
         recalc_job_actuals(state["job_id"])
         job, total, recipe = job_summary(state["job_id"])
@@ -1754,7 +2016,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• {r['chemical_name']} — {fmt(total * r['rate_per_ha'])} {r['unit']}"
             )
         flow.pop(uid, None)
-        await update.message.reply_text("\n".join(lines), reply_markup=main_kb())
+        await update.message.reply_text("\n".join(lines), reply_markup=main_kb(uid))
         return
 
     # ---------- Удалить конкретную работу ----------
@@ -1802,7 +2064,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state and state.get("mode") == "delete_job_confirm":
         if text == BTN_CANCEL_DELETE:
             flow.pop(uid, None)
-            await update.message.reply_text("Удаление отменено.", reply_markup=main_kb())
+            await update.message.reply_text("Удаление отменено.", reply_markup=main_kb(uid))
             return
         if text == BTN_CONFIRM_DELETE:
             job_id = state["job_id"]
@@ -1819,7 +2081,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             flow.pop(uid, None)
             await update.message.reply_text(
                 "🗑 Работа полностью удалена. Поля, культуры, химия и заправщики сохранены.",
-                reply_markup=main_kb()
+                reply_markup=main_kb(uid)
             )
             return
 
@@ -1851,7 +2113,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Админ-справочники ----------
     if text in (BTN_FIELDS, BTN_CULTURES, BTN_CHEM, BTN_FILLERS, BTN_TRACTORS):
-        if uid != ADMIN_ID:
+        if not is_admin(uid):
             await update.message.reply_text("Этот раздел доступен администратору.")
             return
 
@@ -1965,7 +2227,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Выберите действие кнопкой.",
-        reply_markup=active_kb() if job else main_kb()
+        reply_markup=active_kb(uid) if job else main_kb(uid)
     )
 
 
@@ -1977,6 +2239,7 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", whoami))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle)
     )
