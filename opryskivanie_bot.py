@@ -740,6 +740,16 @@ async def send_report(update, where_sql="", params=(), title="📊 ИТОГ"):
             params
         ).fetchall()
 
+        # Рецепт сохраняется вместе с работой: последующие изменения списка
+        # препаратов не должны менять историю обработки по датам.
+        recipes = {}
+        for j in jobs:
+            recipes[j["id"]] = c.execute(
+                """SELECT chemical_name,unit,rate_per_ha
+                   FROM recipes WHERE job_id=? ORDER BY id""",
+                (j["id"],)
+            ).fetchall()
+
     if not jobs:
         await update.message.reply_text("Записей нет.", reply_markup=reports_kb())
         return
@@ -754,10 +764,27 @@ async def send_report(update, where_sql="", params=(), title="📊 ИТОГ"):
             f"🌾 {j['field_name']} | {j['culture']}",
             f"🚜 Обработано: {fmt(ha)} га",
             f"🚿 Заправок: {j['refill_count']}",
-            ""
         ]
+        if recipes[j["id"]]:
+            lines.append("🧪 Химия на обработанную площадь:")
+            for r in recipes[j["id"]]:
+                lines.append(
+                    f"• {r['chemical_name']} — "
+                    f"{fmt(ha * r['rate_per_ha'])} {r['unit']} "
+                    f"({fmt(r['rate_per_ha'])} {r['unit']}/га)"
+                )
+        lines.append("")
     lines.append(f"📊 ВСЕГО: {fmt(total)} га")
-    await update.message.reply_text("\n".join(lines), reply_markup=reports_kb())
+    # Telegram ограничивает сообщение 4096 символами. Длинные отчёты
+    # отправляем несколькими сообщениями в том же порядке.
+    page = []
+    for line in lines:
+        if page and len("\n".join(page)) + len(line) + 1 > 3800:
+            await update.message.reply_text("\n".join(page), reply_markup=reports_kb())
+            page = [f"{title} (продолжение)", ""]
+        page.append(line)
+    if page:
+        await update.message.reply_text("\n".join(page), reply_markup=reports_kb())
 
 
 async def choose_report_date(update):
