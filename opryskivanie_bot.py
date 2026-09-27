@@ -16,6 +16,7 @@ flow = {}
 
 # ---------------- КНОПКИ ----------------
 BTN_NEW = "➕ Новая работа"
+BTN_PLAN_JOB = "📋 Запланированное задание"
 BTN_REPORTS = "📊 Итоги"
 BTN_REFILL_HISTORY = "📚 История заправок"
 BTN_CORRECT_LAST = "✏️ Исправить последнее"
@@ -205,6 +206,7 @@ def keyboard(rows):
 def main_kb(uid=None):
     rows = [
         [BTN_NEW, BTN_REPORTS],
+        [BTN_PLAN_JOB],
         [BTN_REFILL_HISTORY],
         [BTN_CORRECT_LAST, BTN_DELETE_JOB],
         [BTN_FIELDS, BTN_CULTURES],
@@ -220,6 +222,7 @@ def active_kb(uid=None):
     rows = [
         [BTN_NEXT, BTN_PARTIAL],
         [BTN_TOTAL, BTN_PLANNED_REFILLS],
+        [BTN_PLAN_JOB],
         [BTN_REPORTS, BTN_REFILL_HISTORY],
         [BTN_FINISH],
     ]
@@ -497,8 +500,11 @@ def planned_refills(job):
         ]
         full_tanks = int(capacity // tank)
         if full_tanks:
+            tank_word = ("полная заправка" if full_tanks % 10 == 1 and full_tanks % 100 != 11
+                         else "полные заправки" if full_tanks % 10 in (2, 3, 4)
+                         and full_tanks % 100 not in (12, 13, 14) else "полных заправок")
             lines.append(
-                f"Из полного прицепа: {full_tanks} полных заправок бака, "
+                f"Из полного прицепа: {full_tanks} {tank_word} бака, "
                 f"остаток {fmt(capacity - full_tanks * tank)} л"
             )
     return lines
@@ -506,6 +512,8 @@ def planned_refills(job):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if flow.get(uid, {}).get("mode", "").startswith("plan_"):
+        flow.pop(uid, None)
     remember_user(update)
     if is_admin(uid) and uid != ADMIN_ID:
         name = " ".join(filter(None, [update.effective_user.first_name,
@@ -537,6 +545,187 @@ async def begin_job(update):
     mapping = {f"🚜 {r['name']} | {fmt(r['water_capacity_l'])} л": r["id"] for r in rs}
     flow[uid] = {"mode": "job_tractor", "map": mapping}
     await update.message.reply_text("🚜 Выберите трактор:", reply_markup=rows_kb(mapping.keys()))
+
+
+async def begin_plan_job(update):
+    uid = update.effective_user.id
+    with db() as c:
+        tractors = c.execute(
+            "SELECT id,name,water_capacity_l FROM tractors WHERE active=1 ORDER BY name"
+        ).fetchall()
+    if not tractors:
+        await update.message.reply_text(
+            "Сначала добавьте трактор и объём прицепа с водой в разделе «🚜 Тракторы».",
+            reply_markup=active_kb(uid) if active_job(uid) else main_kb(uid)
+        )
+        return
+    mapping = {
+        f"🚜 {r['name']} | {fmt(r['water_capacity_l'])} л": dict(r)
+        for r in tractors
+    }
+    flow[uid] = {"mode": "plan_tractor", "map": mapping}
+    await update.message.reply_text(
+        "📋 ЗАПЛАНИРОВАННОЕ ЗАДАНИЕ\nВыберите трактор с прицепом воды:",
+        reply_markup=rows_kb(mapping.keys())
+    )
+
+
+async def choose_plan_field(update, tractor):
+    uid = update.effective_user.id
+    with db() as c:
+        fields = c.execute(
+            "SELECT id,name,area,culture FROM fields WHERE active=1 ORDER BY name"
+        ).fetchall()
+    mapping = {f"🌾 {r['name']} | {fmt(r['area'])} га": dict(r) for r in fields}
+    flow[uid] = {"mode": "plan_field", "tractor": tractor, "map": mapping}
+    await update.message.reply_text("🌾 Выберите поле:", reply_markup=rows_kb(mapping.keys()))
+
+
+async def choose_plan_chemical(update, state):
+    uid = update.effective_user.id
+    with db() as c:
+        chemicals = c.execute(
+            "SELECT name,unit FROM chemicals WHERE active=1 ORDER BY name"
+        ).fetchall()
+    mapping = {f"🧪 {r['name']}": dict(r) for r in chemicals}
+    state["mode"] = "plan_chemical"
+    state["map"] = mapping
+    flow[uid] = state
+    await update.message.reply_text(
+        "🧪 Выберите препарат для расчёта:",
+        reply_markup=rows_kb([*mapping.keys(), BTN_CHEM_DONE])
+    )
+
+
+async def finish_plan_job(update, state):
+    uid = update.effective_user.id
+    field = state["field"]
+    tractor = state["tractor"]
+    water_rate = state["water_rate"]
+    tank = state["tank"]
+    first_solution = min(tank, float(field["area"]) * water_rate)
+    first_area = first_solution / water_rate
+    plan = {
+        "field_name": field["name"], "field_area": field["area"],
+        "culture": state["culture"], "tank_volume": tank,
+        "water_rate": water_rate, "tractor_name": tractor["name"],
+        "water_capacity_l": tractor["water_capacity_l"],
+    }
+    lines = ["📋 ЗАПЛАНИРОВАННОЕ ЗАДАНИЕ", ""] + planned_refills(plan)
+    lines += [
+        "", "🚿 ПЕРВАЯ ЗАПРАВКА (ПУСТОЙ БАК)",
+        f"💧 Приготовить раствора: {fmt(first_solution)} л",
+        f"🎯 Хватит на: {fmt(first_area)} га",
+    ]
+    if state["recipe"]:
+        lines += ["🧪 Добавить в первую заправку:"]
+        for chem in state["recipe"]:
+            lines.append(
+                f"• {chem['name']} — {fmt(first_area * chem['rate'])} {chem['unit']}"
+            )
+        lines += ["", "🧪 ХИМИЯ НА ВСЁ ПОЛЕ:"]
+        for chem in state["recipe"]:
+            lines.append(
+                f"• {chem['name']}: {fmt(chem['rate'])} {chem['unit']}/га"
+                f" → {fmt(float(field['area']) * chem['rate'])} {chem['unit']}"
+            )
+    lines += ["", "ℹ️ Расчёт справочный, в отчёты не записан."]
+    flow.pop(uid, None)
+    page = []
+    for line in lines:
+        if page and len("\n".join(page)) + len(line) + 1 > 3800:
+            await update.message.reply_text("\n".join(page))
+            page = ["📋 ЗАПЛАНИРОВАННОЕ ЗАДАНИЕ (продолжение)", ""]
+        page.append(line)
+    await update.message.reply_text(
+        "\n".join(page), reply_markup=active_kb(uid) if active_job(uid) else main_kb(uid)
+    )
+
+
+async def handle_plan_job(update, state, text):
+    mode = state["mode"]
+    if mode == "plan_tractor":
+        if text in state["map"]:
+            await choose_plan_field(update, state["map"][text])
+        else:
+            await update.message.reply_text("Выберите трактор кнопкой.")
+        return
+    if mode == "plan_field":
+        if text not in state["map"]:
+            await update.message.reply_text("Выберите поле кнопкой.")
+            return
+        state["field"] = state["map"][text]
+        with db() as c:
+            cultures = [r["name"] for r in c.execute(
+                "SELECT name FROM cultures WHERE active=1 ORDER BY name"
+            ).fetchall()]
+        state["mode"] = "plan_culture"
+        state["cultures"] = cultures
+        await update.message.reply_text(
+            f"🌱 Выберите культуру (сейчас у поля: {state['field']['culture']}):",
+            reply_markup=rows_kb(cultures)
+        )
+        return
+    if mode == "plan_culture":
+        if text not in state["cultures"]:
+            await update.message.reply_text("Выберите культуру кнопкой.")
+            return
+        state["culture"] = text
+        state["mode"] = "plan_tank"
+        await update.message.reply_text("Введите объём бака опрыскивателя в литрах, например 3000:")
+        return
+    if mode == "plan_tank":
+        tank = number(text)
+        if tank is None or not math.isfinite(tank) or tank <= 0:
+            await update.message.reply_text("Введите положительный объём бака, например 3000.")
+            return
+        state["tank"] = tank
+        state["mode"] = "plan_water_rate"
+        await update.message.reply_text("Введите норму воды в л/га, например 107:")
+        return
+    if mode == "plan_water_rate":
+        rate = number(text)
+        if rate is None or not math.isfinite(rate) or rate <= 0:
+            await update.message.reply_text("Введите положительную норму воды, например 107.")
+            return
+        state["water_rate"] = rate
+        state["recipe"] = []
+        await choose_plan_chemical(update, state)
+        return
+    if mode == "plan_chemical":
+        if text == BTN_CHEM_DONE:
+            await finish_plan_job(update, state)
+            return
+        if text not in state["map"]:
+            await update.message.reply_text("Выберите препарат кнопкой.")
+            return
+        state["chemical"] = state["map"][text]
+        state["mode"] = "plan_chem_rate"
+        chem = state["chemical"]
+        await update.message.reply_text(
+            f"🧪 {chem['name']}\nВведите норму на 1 га ({chem['unit']}/га):"
+        )
+        return
+    if mode == "plan_chem_rate":
+        rate = number(text)
+        if rate is None or not math.isfinite(rate) or rate < 0:
+            await update.message.reply_text("Введите норму числом, например 0,15.")
+            return
+        chem = state["chemical"]
+        state["recipe"].append({"name": chem["name"], "unit": chem["unit"], "rate": rate})
+        state["mode"] = "plan_more"
+        await update.message.reply_text(
+            "✅ Препарат добавлен в расчёт.",
+            reply_markup=keyboard([[BTN_ADD_CHEM, BTN_CHEM_DONE], [BTN_CANCEL]])
+        )
+        return
+    if mode == "plan_more":
+        if text == BTN_ADD_CHEM:
+            await choose_plan_chemical(update, state)
+        elif text == BTN_CHEM_DONE:
+            await finish_plan_job(update, state)
+        else:
+            await update.message.reply_text("Выберите «Добавить препарат» или «Химия выбрана».")
 
 
 async def choose_job_field(update, tractor):
@@ -1083,9 +1272,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    remember_user(update)
     text = update.message.text.strip()
     state = flow.get(uid)
+    # План использует справочники только для чтения и не сохраняет даже
+    # промежуточные ответы в базу: состояние живёт лишь в памяти процесса.
+    if text != BTN_PLAN_JOB and not (state and state.get("mode", "").startswith("plan_")):
+        remember_user(update)
     job = active_job(uid)
 
     admin_edit_modes = {
@@ -1119,6 +1311,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Главное меню.",
             reply_markup=active_kb(uid) if job else main_kb(uid)
         )
+        return
+
+    if text == BTN_PLAN_JOB:
+        await begin_plan_job(update)
+        return
+
+    if state and state.get("mode", "").startswith("plan_"):
+        await handle_plan_job(update, state, text)
         return
 
     # ---------- Дополнительные администраторы ----------
