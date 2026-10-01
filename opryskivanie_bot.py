@@ -38,6 +38,8 @@ BTN_CULTURES = "🌱 Культуры"
 BTN_CHEM = "🧪 Химия"
 BTN_FILLERS = "👤 Заправщики"
 BTN_TRACTORS = "🚜 Тракторы"
+BTN_TANK_VOLUMES = "🚿 Баки опрыскивателя"
+BTN_WATER_RATES = "💧 Расход воды"
 BTN_ADMINS = "👑 Администраторы"
 BTN_ADD_ADMIN = "➕ Добавить администратора"
 BTN_REMOVE_ADMIN = "🗑 Удалить администратора"
@@ -199,6 +201,19 @@ def fmt(value):
     return f"{float(value or 0):.2f}".replace(".", ",")
 
 
+def fmt_setting(value):
+    return f"{float(value):.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def setting_label(table, value):
+    unit = "л" if table == "tank_volumes" else "л/га"
+    return f"{fmt_setting(value)} {unit}"
+
+
+def setting_title(table):
+    return BTN_TANK_VOLUMES if table == "tank_volumes" else BTN_WATER_RATES
+
+
 def keyboard(rows):
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
@@ -212,6 +227,7 @@ def main_kb(uid=None):
         [BTN_FIELDS, BTN_CULTURES],
         [BTN_CHEM, BTN_FILLERS],
         [BTN_TRACTORS],
+        [BTN_TANK_VOLUMES, BTN_WATER_RATES],
     ]
     if uid is not None and is_admin(uid):
         rows.append([BTN_ADMINS])
@@ -268,6 +284,113 @@ def rows_kb(items, back=True):
     return keyboard(rows)
 
 
+async def choose_setting(update, state, table, mode):
+    uid = update.effective_user.id
+    with db() as c:
+        rows = c.execute(
+            f"SELECT value FROM {table} WHERE active=1 ORDER BY value"
+        ).fetchall()
+    if not rows:
+        flow.pop(uid, None)
+        await update.message.reply_text(
+            f"Список пуст. Сначала добавьте значение в разделе «{setting_title(table)}».",
+            reply_markup=active_kb(uid) if active_job(uid) else main_kb(uid)
+        )
+        return
+    state["mode"] = mode
+    state["values"] = {setting_label(table, r["value"]): r["value"] for r in rows}
+    flow[uid] = state
+    await update.message.reply_text(
+        "Выберите объём бака опрыскивателя:" if table == "tank_volumes"
+        else "Выберите норму расхода воды:",
+        reply_markup=rows_kb(state["values"].keys())
+    )
+
+
+async def handle_numeric_section(update, state, text):
+    uid = update.effective_user.id
+    table = state["table"]
+    title = setting_title(table)
+    mode = state["mode"]
+    if mode == "numeric_section":
+        if text == BTN_LIST:
+            with db() as c:
+                rows = c.execute(
+                    f"SELECT value FROM {table} WHERE active=1 ORDER BY value"
+                ).fetchall()
+            lines = [f"• {setting_label(table, r['value'])}" for r in rows]
+            await update.message.reply_text(
+                f"📋 {title}\n\n" + ("\n".join(lines) if lines else "Список пуст."),
+                reply_markup=section_kb(table)
+            )
+            return
+        if text == BTN_ADD:
+            state["mode"] = "numeric_add"
+            await update.message.reply_text(
+                "Введите объём бака в литрах, например 3000 или 3200:"
+                if table == "tank_volumes" else
+                "Введите расход воды в л/га, например 100 или 110:"
+            )
+            return
+        if text in (BTN_EDIT, BTN_DELETE):
+            with db() as c:
+                rows = c.execute(
+                    f"SELECT id,value FROM {table} WHERE active=1 ORDER BY value"
+                ).fetchall()
+            if not rows:
+                await update.message.reply_text("Список пуст. Сначала добавьте значение.")
+                return
+            mapping = {setting_label(table, r["value"]): r["id"] for r in rows}
+            flow[uid] = {
+                "mode": "numeric_select", "table": table,
+                "action": "edit" if text == BTN_EDIT else "delete", "map": mapping,
+            }
+            await update.message.reply_text(
+                "Что изменить?" if text == BTN_EDIT else "Что удалить?",
+                reply_markup=rows_kb(mapping.keys())
+            )
+            return
+    if mode == "numeric_select":
+        if text not in state["map"]:
+            await update.message.reply_text("Выберите значение кнопкой.")
+            return
+        item_id = state["map"][text]
+        if state["action"] == "delete":
+            with db() as c:
+                c.execute(f"UPDATE {table} SET active=0 WHERE id=?", (item_id,))
+            flow[uid] = {"mode": "numeric_section", "table": table}
+            await update.message.reply_text(
+                "🗑 Удалено из списка. Старые работы сохранены.",
+                reply_markup=section_kb(table)
+            )
+            return
+        flow[uid] = {"mode": "numeric_edit", "table": table, "id": item_id}
+        await update.message.reply_text(f"Текущее значение: {text}\nВведите новое число:")
+        return
+    if mode in ("numeric_add", "numeric_edit"):
+        value = number(text)
+        upper_limit = 1000000 if table == "tank_volumes" else 10000
+        if value is None or not math.isfinite(value) or not 0 < value <= upper_limit:
+            await update.message.reply_text("Введите положительное число, например 3000 или 110.")
+            return
+        with db() as c:
+            if mode == "numeric_add":
+                c.execute(f"INSERT OR IGNORE INTO {table}(value) VALUES(?)", (value,))
+                c.execute(f"UPDATE {table} SET active=1 WHERE value=?", (value,))
+            else:
+                try:
+                    c.execute(f"UPDATE {table} SET value=? WHERE id=?", (value, state["id"]))
+                except sqlite3.IntegrityError:
+                    await update.message.reply_text("Такое значение уже есть. Введите другое.")
+                    return
+        flow[uid] = {"mode": "numeric_section", "table": table}
+        await update.message.reply_text(
+            f"✅ Сохранено: {setting_label(table, value)}."
+            " Старые работы не изменены.",
+            reply_markup=section_kb(table)
+        )
+
+
 def init_db():
     with db() as c:
         c.executescript("""
@@ -302,6 +425,18 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
             water_capacity_l REAL NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS tank_volumes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            value REAL NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS water_rates(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            value REAL NOT NULL UNIQUE,
             active INTEGER NOT NULL DEFAULT 1
         );
 
@@ -390,6 +525,17 @@ def init_db():
         ]:
             if col not in refill_cols:
                 c.execute(f"ALTER TABLE refills ADD COLUMN {col} {ddl}")
+
+        # Переносим ранее введённые значения из работ в новые справочники.
+        # Данные самих работ и их отчёты при этом не меняются.
+        c.execute(
+            """INSERT OR IGNORE INTO tank_volumes(value)
+               SELECT DISTINCT tank_volume FROM jobs WHERE tank_volume>0"""
+        )
+        c.execute(
+            """INSERT OR IGNORE INTO water_rates(value)
+               SELECT DISTINCT water_rate FROM jobs WHERE water_rate>0"""
+        )
 
         if c.execute("SELECT COUNT(*) n FROM fields").fetchone()["n"] == 0:
             c.executemany(
@@ -671,24 +817,20 @@ async def handle_plan_job(update, state, text):
             await update.message.reply_text("Выберите культуру кнопкой.")
             return
         state["culture"] = text
-        state["mode"] = "plan_tank"
-        await update.message.reply_text("Введите объём бака опрыскивателя в литрах, например 3000:")
+        await choose_setting(update, state, "tank_volumes", "plan_tank")
         return
     if mode == "plan_tank":
-        tank = number(text)
-        if tank is None or not math.isfinite(tank) or tank <= 0:
-            await update.message.reply_text("Введите положительный объём бака, например 3000.")
+        if text not in state["values"]:
+            await update.message.reply_text("Выберите бак из списка кнопкой.")
             return
-        state["tank"] = tank
-        state["mode"] = "plan_water_rate"
-        await update.message.reply_text("Введите норму воды в л/га, например 107:")
+        state["tank"] = state["values"][text]
+        await choose_setting(update, state, "water_rates", "plan_water_rate")
         return
     if mode == "plan_water_rate":
-        rate = number(text)
-        if rate is None or not math.isfinite(rate) or rate <= 0:
-            await update.message.reply_text("Введите положительную норму воды, например 107.")
+        if text not in state["values"]:
+            await update.message.reply_text("Выберите расход воды из списка кнопкой.")
             return
-        state["water_rate"] = rate
+        state["water_rate"] = state["values"][text]
         state["recipe"] = []
         await choose_plan_chemical(update, state)
         return
@@ -1287,7 +1429,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "edit_tractor_capacity", "field_culture_select", "field_culture_choose",
     }
     if state and not is_admin(uid) and (
-        state.get("table") in ("fields", "cultures", "chemicals", "fillers", "tractors")
+        state.get("table") in ("fields", "cultures", "chemicals", "fillers", "tractors",
+                               "tank_volumes", "water_rates")
         or state.get("mode") in admin_edit_modes
     ):
         flow.pop(uid, None)
@@ -1315,6 +1458,19 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == BTN_PLAN_JOB:
         await begin_plan_job(update)
+        return
+
+    if text in (BTN_TANK_VOLUMES, BTN_WATER_RATES):
+        if not is_admin(uid):
+            await update.message.reply_text("Этот раздел доступен администратору.")
+            return
+        table = "tank_volumes" if text == BTN_TANK_VOLUMES else "water_rates"
+        flow[uid] = {"mode": "numeric_section", "table": table}
+        await update.message.reply_text(text, reply_markup=section_kb(table))
+        return
+
+    if state and state.get("mode", "").startswith("numeric_"):
+        await handle_numeric_section(update, state, text)
         return
 
     if state and state.get("mode", "").startswith("plan_"):
@@ -1466,31 +1622,23 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ok:
             state["culture"] = text
-            state["mode"] = "tank"
-            await update.message.reply_text(
-                "💧 Введите объём полного опрыскивателя, л.\n"
-                "Например: 3000"
-            )
+            await choose_setting(update, state, "tank_volumes", "tank")
         return
 
     if state and state.get("mode") == "tank":
-        value = number(text)
-        if not value or value <= 0:
-            await update.message.reply_text("Введите объём числом, например 3000.")
+        if text not in state["values"]:
+            await update.message.reply_text("Выберите объём бака из списка кнопкой.")
             return
 
-        state["tank"] = value
-        state["mode"] = "water_rate"
-        await update.message.reply_text(
-            "💧 Введите норму воды, л/га.\nНапример: 110"
-        )
+        state["tank"] = state["values"][text]
+        await choose_setting(update, state, "water_rates", "water_rate")
         return
 
     if state and state.get("mode") == "water_rate":
-        value = number(text)
-        if not value or value <= 0:
-            await update.message.reply_text("Введите норму числом, например 110.")
+        if text not in state["values"]:
+            await update.message.reply_text("Выберите расход воды из списка кнопкой.")
             return
+        value = state["values"][text]
 
         field = state["field"]
         actor_id, actor_name, actor_role = entry_actor(update)
